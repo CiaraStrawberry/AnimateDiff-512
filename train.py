@@ -332,91 +332,96 @@ def main(
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
-            pixel_values = batch["pixel_values"].to(local_rank)
+                        pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
+            with torch.no_grad():
+                if not image_finetune:
+                    pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                    latents = vae.encode(pixel_values).latent_dist
+                    latents = latents.sample()
+                    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                else:
+                    latents = vae.encode(pixel_values).latent_dist
+                    latents = latents.sample()
 
-            # Randomly decide how many frames from each video to mask out
-            #proportions_to_mask = torch.rand(bsz, device=latents.device) * 0.6 + 0.2
-            num_frames_to_mask = torch.randint(1, 16, (bsz,), device=latents.device)
-
-            # Initialize the mask tensor
-            provided_frames_mask = torch.zeros(bsz, video_length, device=latents.device)
-
-
-            # Randomly mask frames based on the decided proportions
-            for i, num in enumerate(num_frames_to_mask):
-                provided_indices = torch.randperm(video_length)[:num]
-                provided_frames_mask[i, provided_indices] = 1
-            # Ensure the mask is of the same shape as latents
-            provided_frames_mask = provided_frames_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+                latents = latents * 0.18215
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            
+
             # Sample a random timestep for each video
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
-            
+
             # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            masked_original_frames = latents * provided_frames_mask
-            noisy_latents = noisy_latents * (1 - provided_frames_mask) + masked_original_frames
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-
-            
             # Get the text embedding for conditioning
             with torch.no_grad():
                 prompt_ids = tokenizer(
                     batch['text'], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
                 ).input_ids.to(latents.device)
                 encoder_hidden_states = text_encoder(prompt_ids)[0]
-                
+
+            # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
+            mask_proportion = torch.rand(1).item()
+            mask_flag = torch.rand(bsz) < mask_proportion
+            mask = torch.zeros_like(latents)
+            for i in range(bsz):
+                if mask_flag[i]:
+                    mask[i, ...] = 1
+
+            # Apply the mask to the latents to black out the masked regions
+            masked_latents = latents * (1 - mask)
+
+            # For the inpainting pipeline, we'll use the masked_latents as input
+            #latent_model_input = torch.cat([latents] * 2)  # Assuming do_classifier_free_guidance is True for simplicity
+            #latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
+            #if num_channels_unet == 9:
+            latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
+
+
+            # Predict the noise residual using the inpainting model
+            noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
+
             # Get the target for loss depending on the prediction type
-           if noise_scheduler.config.prediction_type == "epsilon":
+            if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
-           elif noise_scheduler.config.prediction_type == "v_prediction":
-                raise NotImplementedError
-           else:
+            else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-
-            # Predict the noise residual and compute loss
-            # Mixed-precision training
-            with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                squared_diff = (model_pred - target) ** 2
-                masked_diff = (1 - provided_frames_mask) * squared_diff
-                loss = torch.mean(masked_diff)
+            # Compute the loss
+            loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
 
             # Backpropagate
             if mixed_precision_training:
                 scaler.scale(loss).backward()
-                """ >>> gradient clipping >>> """
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                """ <<< gradient clipping <<< """
             else:
                 loss.backward()
-                """ >>> gradient clipping >>> """
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                """ <<< gradient clipping <<< """
 
-            if steps % gradient_accumulation_steps == 0:
+            # Implement Gradient Accumulation
+            if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 if mixed_precision_training:
+                    """ >>> gradient clipping >>> """
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                    """ <<< gradient clipping <<< """
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    """ >>> gradient clipping >>> """
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                    """ <<< gradient clipping <<< """
                     optimizer.step()
 
-                # Zero out gradients so they aren't accumulated
+                lr_scheduler.step()
                 optimizer.zero_grad()
 
-            lr_scheduler.step()
             progress_bar.update(1)
             global_step += 1
-
             
             ### <<<< Training <<<< ###
             
