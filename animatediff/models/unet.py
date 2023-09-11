@@ -323,7 +323,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
-        provided_frames_mask: Optional[torch.Tensor] = None,  # <-- condition
         attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNet3DConditionOutput, Tuple]:
@@ -396,9 +395,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
             class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
             emb = emb + class_emb
-        
-        
-        
+
         # pre-process
         sample = self.conv_in(sample)
 
@@ -449,14 +446,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 )
 
         # post-process
-        if provided_frames_mask is not None:
-                sample = provided_frames_mask * sample + (1 - provided_frames_mask) * sample
-
-        # post-process
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)
-
 
         if not return_dict:
             return (sample,)
