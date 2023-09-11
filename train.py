@@ -336,15 +336,17 @@ def main(
             video_length = pixel_values.shape[1]
 
             # Randomly decide how many frames from each video to mask out
-            num_frames_to_mask = torch.randint(1, video_length, (bsz,), device=latents.device)
+            #proportions_to_mask = torch.rand(bsz, device=latents.device) * 0.6 + 0.2
+            num_frames_to_mask = torch.randint(1, 16, (bsz,), device=latents.device)
 
-            # Generate a mask tensor
-            # 1 indicates the frame is provided and 0 indicates it's to be generated
+            # Initialize the mask tensor
             provided_frames_mask = torch.zeros(bsz, video_length, device=latents.device)
+
+
+            # Randomly mask frames based on the decided proportions
             for i, num in enumerate(num_frames_to_mask):
                 provided_indices = torch.randperm(video_length)[:num]
                 provided_frames_mask[i, provided_indices] = 1
-
             # Ensure the mask is of the same shape as latents
             provided_frames_mask = provided_frames_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
 
@@ -395,14 +397,21 @@ def main(
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
                 """ <<< gradient clipping <<< """
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
                 """ >>> gradient clipping >>> """
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
                 """ <<< gradient clipping <<< """
-                optimizer.step()
+
+            if steps % gradient_accumulation_steps == 0:
+                if mixed_precision_training:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                # Zero out gradients so they aren't accumulated
+                optimizer.zero_grad()
 
             lr_scheduler.step()
             progress_bar.update(1)
