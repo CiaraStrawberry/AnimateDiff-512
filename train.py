@@ -334,17 +334,19 @@ def main(
             # Convert videos to latent space            
             pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
-            with torch.no_grad():
-                if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
-                    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
-                else:
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
 
-                latents = latents * 0.18215
+            # Randomly decide how many frames from each video to mask out
+            num_frames_to_mask = torch.randint(1, video_length, (bsz,), device=latents.device)
+
+            # Generate a mask tensor
+            # 1 indicates the frame is provided and 0 indicates it's to be generated
+            provided_frames_mask = torch.zeros(bsz, video_length, device=latents.device)
+            for i, num in enumerate(num_frames_to_mask):
+                provided_indices = torch.randperm(video_length)[:num]
+                provided_frames_mask[i, provided_indices] = 1
+
+            # Ensure the mask is of the same shape as latents
+            provided_frames_mask = provided_frames_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -356,7 +358,10 @@ def main(
             
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            masked_original_frames = latents * provided_frames_mask
+            noisy_latents = noisy_latents * (1 - provided_frames_mask) + masked_original_frames
+
+
             
             # Get the text embedding for conditioning
             with torch.no_grad():
@@ -366,18 +371,20 @@ def main(
                 encoder_hidden_states = text_encoder(prompt_ids)[0]
                 
             # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
+           if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
+           elif noise_scheduler.config.prediction_type == "v_prediction":
                 raise NotImplementedError
-            else:
+           else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
 
             # Predict the noise residual and compute loss
             # Mixed-precision training
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                squared_diff = (model_pred - target) ** 2
+                masked_diff = (1 - provided_frames_mask) * squared_diff
+                loss = torch.mean(masked_diff)
 
             optimizer.zero_grad()
 
@@ -400,6 +407,7 @@ def main(
             lr_scheduler.step()
             progress_bar.update(1)
             global_step += 1
+
             
             ### <<<< Training <<<< ###
             
