@@ -113,7 +113,7 @@ def main(
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 4,
+    gradient_accumulation_steps: int = 3,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -532,11 +532,11 @@ def main(
     
                 logging.info(f"Saved samples to {save_path}")
                 
-        logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-        progress_bar.set_postfix(**logs)
-        
-        if global_step >= max_train_steps:
-            break
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            
+            if global_step >= max_train_steps:
+                break
             
     dist.destroy_process_group()
 
