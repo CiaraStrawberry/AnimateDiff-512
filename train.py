@@ -159,11 +159,13 @@ def main(
         os.makedirs(f"{output_dir}/sanity_check", exist_ok=True)
         os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
         OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
-
+    print(pretrained_model_path)
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-
-    vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
+    vae_Dir = "/workspace/AnimateDiff-512/models/StableDiffusion3"
+    
+    vae          = AutoencoderKL.from_pretrained(vae_Dir, subfolder="vae")
+    #vae = AutoencoderKL
     tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     if not image_finetune:
@@ -180,8 +182,11 @@ def main(
         unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
         if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
         state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
-
-        m, u = unet.load_state_dict(state_dict, strict=False)
+        current_model_dict = unet.state_dict()
+        #loaded_state_dict = torch.load(unet_checkpoint_path, map_location='cpu')
+        new_state_dict={k:v if v.size()==current_model_dict[k].size()  else  current_model_dict[k] for k,v in zip(current_model_dict.keys(), unet_checkpoint_path.values())}
+        
+        m, u = unet.load_state_dict(new_state_dict, strict=False)
         zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
         assert len(u) == 0
         
@@ -318,6 +323,7 @@ def main(
                 
             # Data batch sanity check
             if epoch == first_epoch and step == 0:
+                
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
@@ -332,10 +338,11 @@ def main(
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
-                        pixel_values = batch["pixel_values"].to(local_rank)
+            pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
             with torch.no_grad():
                 if not image_finetune:
+                    print(f"shape = {pixel_values.shape}")
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
@@ -367,13 +374,20 @@ def main(
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
             mask_proportion = torch.rand(1).item()
             mask_flag = torch.rand(bsz) < mask_proportion
-            mask = torch.zeros_like(latents)
+            
+            # Create a single channel mask
+            single_channel_mask = torch.zeros(bsz, 1, *latents.shape[2:])
+            
             for i in range(bsz):
                 if mask_flag[i]:
-                    mask[i, ...] = 1
+                    single_channel_mask[i, ...] = 1
+            
+            # Expand the single channel mask to match the channel dimensions of latents
+            mask = single_channel_mask.to(latents.device)
+            mask_big = single_channel_mask.expand_as(latents).to(latents.device)
 
             # Apply the mask to the latents to black out the masked regions
-            masked_latents = latents * (1 - mask)
+            masked_latents = latents * (1 - mask_big)
 
             # For the inpainting pipeline, we'll use the masked_latents as input
             #latent_model_input = torch.cat([latents] * 2)  # Assuming do_classifier_free_guidance is True for simplicity
@@ -383,6 +397,8 @@ def main(
 
 
             # Predict the noise residual using the inpainting model
+            #print(f"noise shape {noisy_latents.shape} mask shape {mask.shape} masked_latents {masked_latents.shape}")
+            print(f"latent shape {latent_model_input.shape}")
             noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
 
             # Get the target for loss depending on the prediction type
@@ -452,9 +468,32 @@ def main(
                 
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
                 width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-
+            
                 prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
-
+                
+                mask = torch.tensor([1, 0, 1, 1]) 
+            
+                # Sample a random batch from the validation dataloader
+                random_val_batch = next(iter(train_dataloader))  # Assuming validation_data is a DataLoader
+                
+                # Convert videos to latent space
+                pixel_values = random_val_batch["pixel_values"].to(local_rank)  # Assuming the key is "pixel_values" for the batch
+                video_length = pixel_values.shape[1]
+                with torch.no_grad():
+                    if not image_finetune:
+                        pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
+                        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                    else:
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
+            
+                    latents = latents * 0.18215
+            
+                # Sample noise that we'll add to the latents
+                #noise = torch.randn_like(latents)
+            
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
                         sample = validation_pipeline(
@@ -463,23 +502,26 @@ def main(
                             video_length = train_data.sample_n_frames,
                             height       = height,
                             width        = width,
+                            latents      = latents,
+                            mask         = mask,
                             **validation_data,
                         ).videos
+                        print("saving sample")
                         save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
                         samples.append(sample)
-                        
-                    else:
-                        sample = validation_pipeline(
-                            prompt,
-                            generator           = generator,
-                            height              = height,
-                            width               = width,
-                            num_inference_steps = validation_data.get("num_inference_steps", 25),
-                            guidance_scale      = validation_data.get("guidance_scale", 8.),
-                        ).images[0]
-                        sample = torchvision.transforms.functional.to_tensor(sample)
-                        samples.append(sample)
-                
+                    
+                else:
+                    sample = validation_pipeline(
+                        prompt,
+                        generator           = generator,
+                        height              = height,
+                        width               = width,
+                        num_inference_steps = validation_data.get("num_inference_steps", 25),
+                        guidance_scale      = validation_data.get("guidance_scale", 8.),
+                    ).images[0]
+                    sample = torchvision.transforms.functional.to_tensor(sample)
+                    samples.append(sample)
+            
                 if not image_finetune:
                     samples = torch.concat(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.gif"
@@ -489,14 +531,14 @@ def main(
                     samples = torch.stack(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.png"
                     torchvision.utils.save_image(samples, save_path, nrow=4)
-
+    
                 logging.info(f"Saved samples to {save_path}")
                 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            
-            if global_step >= max_train_steps:
-                break
+        logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        progress_bar.set_postfix(**logs)
+        
+        if global_step >= max_train_steps:
+            break
             
     dist.destroy_process_group()
 
