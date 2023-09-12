@@ -283,7 +283,37 @@ class AnimationPipeline(DiffusionPipeline):
                 f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
                 f" {type(callback_steps)}."
             )
+    def prepare_mask_latents(
+        self, mask, masked_video_latents, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # Resize the mask to latents shape as we concatenate the mask to the latents
+        #mask = torch.nn.functional.interpolate(
+        #    mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        #)
+       # mask = mask.to(device=device, dtype=dtype)
+    #
+        
+    
+        # Duplicate mask and masked_video_latents for each generation per prompt
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError("...")
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1, 1)  # Added an extra dimension for video length
+        if masked_video_latents.shape[0] < batch_size:
+            if not batch_size % masked_video_latents.shape[0] == 0:
+                raise ValueError("...")
+            masked_video_latents = masked_video_latents.repeat(batch_size // masked_video_latents.shape[0], 1, 1, 1, 1)  # Added an extra dimension for video length
+    
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+        masked_video_latents = (
+            torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
+        )
+    
+        # Aligning device
+        masked_video_latents = masked_video_latents.to(device=device, dtype=dtype)
+        return mask, masked_video_latents
 
+    
     def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -348,7 +378,7 @@ class AnimationPipeline(DiffusionPipeline):
             batch_size = latents.shape[0]
         if isinstance(prompt, list):
             batch_size = len(prompt)
-
+        
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -359,24 +389,23 @@ class AnimationPipeline(DiffusionPipeline):
         prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
         if negative_prompt is not None:
             negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size 
+        
         text_embeddings = self._encode_prompt(
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
+        print (f"initial text shape {text_embeddings.shape} nd class {do_classifier_free_guidance}")
+        
+        
 
-        #num_to_mask = int(mask_proportion * latents.shape[0])
-        #indices_to_mask = torch.randperm(latents.shape[0])[:num_to_mask]
-        #latents[indices_to_mask] = 0
-
-        mask_1d = torch.tensor([1, 0, 1, 1], device=device)
         
         # Extend the mask_1d to the video_length using modulo operation
-        extended_mask = mask_1d[(torch.arange(latents.shape[2]) % len(mask_1d)).long()]
+        extended_mask = masks[(torch.arange(latents.shape[2]) % len(masks)).long()]
         
         # Expand the extended_mask to the desired shape
-        mask_expanded = extended_mask[:, None, None].expand(-1, latents.shape[3], latents.shape[4])
+        #mask_expanded = extended_mask[:, None, None].expand(-1, latents.shape[3], latents.shape[4])
         
         # Add the batch and channel dimensions
-        mask_expanded = mask_expanded[None, None, :, :, :]
+        mask_expanded = extended_mask[None, None, :, :, :]
         
         # Repeat it for all batches
         mask_expanded = mask_expanded.repeat(latents.shape[0], 1, 1, 1, 1)
@@ -387,6 +416,19 @@ class AnimationPipeline(DiffusionPipeline):
         # Apply the mask to latents
         masked_latents = latents * masks
 
+
+        mask, masked_latents_input = self.prepare_mask_latents(
+            masks,
+            masked_latents,  # Assuming 'masked_video' is the variable you have or passed to the __call__ method
+            batch_size,
+            height,
+            width,
+            text_embeddings.dtype,  # Assuming you want to use the same dtype as text_embeddings
+            device,
+            generator,
+            do_classifier_free_guidance=do_classifier_free_guidance
+        )
+        
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -402,7 +444,7 @@ class AnimationPipeline(DiffusionPipeline):
             text_embeddings.dtype,
             device,
             generator,
-            latents,
+            masked_latents,
         )
         latents_dtype = latents.dtype
 
@@ -414,22 +456,24 @@ class AnimationPipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                #latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                #latent_model_input = self.scheduler.scale_model_input(latents, t)
+                
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # Concatenate latents, masks, and masked latents based on U-Net's expected input channels
                 #if num_channels_unet == 9:
-                print (f"latent {latents.shape} mask {masks.shape} masked {masked_latents.shape}")
-                latent_model_input = torch.cat([latents, masks, masked_latents], dim=1)
+                #print (f"latent {latent_model_input.shape} mask {mask.shape} masked {masked_latents_input.shape}")
+                latent_model_input = torch.cat([latent_model_input, mask, masked_latents_input], dim=1)
               
                 # predict the noise residual
-                print (f"pipe latent model input {latent_model_input.shape}")
+                #print (f"pipe latent model input {latent_model_input.shape} and classifier guide {do_classifier_free_guidance}")
+                #print(f"text embeddings pipe shape {text_embeddings.shape}")
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
 
                 # perform guidance
-                #if do_classifier_free_guidance:
-                 #   noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                 #   noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
