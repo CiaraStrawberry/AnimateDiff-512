@@ -1,7 +1,7 @@
 # Adapted from https://github.com/showlab/Tune-A-Video/blob/main/tuneavideo/pipelines/pipeline_tuneavideo.py
 
 import inspect
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, Tuple
 from dataclasses import dataclass
 
 import numpy as np
@@ -313,6 +313,54 @@ class AnimationPipeline(DiffusionPipeline):
         masked_video_latents = masked_video_latents.to(device=device, dtype=dtype)
         return mask, masked_video_latents
 
+    #cant import for some stupid reason
+    def randn_tensor(
+        self,
+        shape: Union[Tuple, List],
+        generator: Optional[Union[List["torch.Generator"], "torch.Generator"]] = None,
+        device: Optional["torch.device"] = None,
+        dtype: Optional["torch.dtype"] = None,
+        layout: Optional["torch.layout"] = None,
+    ):
+        """A helper function to create random tensors on the desired `device` with the desired `dtype`. When
+        passing a list of generators, you can seed each batch size individually. If CPU generators are passed, the tensor
+        is always created on the CPU.
+        """
+        # device on which tensor is created defaults to device
+        rand_device = device
+        batch_size = shape[0]
+    
+        layout = layout or torch.strided
+        device = device or torch.device("cpu")
+    
+        if generator is not None:
+            gen_device_type = generator.device.type if not isinstance(generator, list) else generator[0].device.type
+            if gen_device_type != device.type and gen_device_type == "cpu":
+                rand_device = "cpu"
+                if device != "mps":
+                    logger.info(
+                        f"The passed generator was created on 'cpu' even though a tensor on {device} was expected."
+                        f" Tensors will be created on 'cpu' and then moved to {device}. Note that one can probably"
+                        f" slighly speed up this function by passing a generator that was created on the {device} device."
+                    )
+            elif gen_device_type != device.type and gen_device_type == "cuda":
+                raise ValueError(f"Cannot generate a {device} tensor from a generator of type {gen_device_type}.")
+    
+        # make sure generator list of length 1 is treated like a non-list
+        if isinstance(generator, list) and len(generator) == 1:
+            generator = generator[0]
+    
+        if isinstance(generator, list):
+            shape = (1,) + shape[1:]
+            latents = [
+                torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
+                for i in range(batch_size)
+            ]
+            latents = torch.cat(latents, dim=0).to(device)
+        else:
+            latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
+    
+        return latents
     
     def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
@@ -322,27 +370,19 @@ class AnimationPipeline(DiffusionPipeline):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
         if latents is None:
-            rand_device = "cpu" if device.type == "mps" else device
-
-            if isinstance(generator, list):
-                shape = shape
-                # shape = (1,) + shape[1:]
-                latents = [
-                    torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype)
-                    for i in range(batch_size)
-                ]
-                latents = torch.cat(latents, dim=0).to(device)
-            else:
-                latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype).to(device)
-        else:
-            #if latents.shape != shape:
-           #     raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
-            latents = latents.to(device)
+            noise = self.randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            latents = noise 
+            # if pure noise then scale the initial latents by the  Scheduler's init sigma
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
+        print(f"done latents shape {latents.shape}")
         return latents
 
+
+
+    
     @torch.no_grad()
     def __call__(
         self,
@@ -396,29 +436,31 @@ class AnimationPipeline(DiffusionPipeline):
         print (f"initial text shape {text_embeddings.shape} nd class {do_classifier_free_guidance}")
         
         
-
-        
         # Extend the mask_1d to the video_length using modulo operation
-        extended_mask = masks[(torch.arange(latents.shape[2]) % len(masks)).long()]
-        
-        # Expand the extended_mask to the desired shape
-        #mask_expanded = extended_mask[:, None, None].expand(-1, latents.shape[3], latents.shape[4])
-        
-        # Add the batch and channel dimensions
-        mask_expanded = extended_mask[None, None, :, :, :]
-        
-        # Repeat it for all batches
-        mask_expanded = mask_expanded.repeat(latents.shape[0], 1, 1, 1, 1)
-        
+        #mask_expanded = masks[:, None, None, None]  # Adds 3 additional dimensions, giving a shape of [16, 1, 1, 1]
+        #mask_expanded = mask_expanded[None, :]
+
+        masks = masks[None, None, :, None, None]
+        mask_expanded = masks.expand(latents.shape[0], latents.shape[1], -1, latents.shape[3], latents.shape[4])
+        mask_single_channel = masks.expand(latents.shape[0], 1, -1, latents.shape[3], latents.shape[4])
+        # Repeat the mask to match the dimensions of latents
+        #mask_expanded = mask_expanded.expand(latents.shape[0], -1, 1, latents.shape[3], latents.shape[4])
+
+
+    
         # Invert the mask (if needed)
-        masks = 1 - mask_expanded
+        inverted_masks = 1 - mask_expanded
+        
+        print(latents.shape)
+        print(masks.shape)
         
         # Apply the mask to latents
-        masked_latents = latents * masks
+        masked_latents = latents * inverted_masks
 
-
+    
+        print(masked_latents.shape)
         mask, masked_latents_input = self.prepare_mask_latents(
-            masks,
+            mask_single_channel,
             masked_latents,  # Assuming 'masked_video' is the variable you have or passed to the __call__ method
             batch_size,
             height,
@@ -434,17 +476,17 @@ class AnimationPipeline(DiffusionPipeline):
         timesteps = self.scheduler.timesteps
 
         # Prepare latent variables
-        num_channels_latents = self.unet.in_channels
+        #num_channels_latents = self.unet.in_channels
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
-            num_channels_latents,
+            4,
             video_length,
             height,
             width,
             text_embeddings.dtype,
             device,
             generator,
-            masked_latents,
+            None,
         )
         latents_dtype = latents.dtype
 
@@ -466,8 +508,8 @@ class AnimationPipeline(DiffusionPipeline):
                 latent_model_input = torch.cat([latent_model_input, mask, masked_latents_input], dim=1)
               
                 # predict the noise residual
-                #print (f"pipe latent model input {latent_model_input.shape} and classifier guide {do_classifier_free_guidance}")
-                #print(f"text embeddings pipe shape {text_embeddings.shape}")
+               # print (f"pipe latent model input {latent_model_input.shape} and classifier guide {do_classifier_free_guidance}")
+               # print(f"text embeddings pipe shape {text_embeddings.shape}")
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
 
                 # perform guidance
