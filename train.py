@@ -162,7 +162,7 @@ def main(
     print(pretrained_model_path)
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    vae_Dir = "/workspace/AnimateDiff-512/models/StableDiffusion3"
+    vae_Dir = "/workspace/AnimateDiff-512/models/StableDiffusion-vae"
     
     vae          = AutoencoderKL.from_pretrained(vae_Dir, subfolder="vae")
     #vae = AutoencoderKL
@@ -342,7 +342,7 @@ def main(
             video_length = pixel_values.shape[1]
             with torch.no_grad():
                 if not image_finetune:
-                    print(f"shape = {pixel_values.shape}")
+                    #print(f"shape = {pixel_values.shape}")
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
@@ -398,7 +398,8 @@ def main(
 
             # Predict the noise residual using the inpainting model
             #print(f"noise shape {noisy_latents.shape} mask shape {mask.shape} masked_latents {masked_latents.shape}")
-            print(f"latent shape {latent_model_input.shape}")
+            #print(f"latent shape {latent_model_input.shape}")
+            #print(f"text embeddings train  shape {encoder_hidden_states.shape}")
             noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
 
             # Get the target for loss depending on the prediction type
@@ -446,17 +447,11 @@ def main(
                 wandb.log({"train_loss": loss.item()}, step=global_step)
                 
             # Save checkpoint
-            if is_main_process and (global_step % checkpointing_steps == 0 or step == len(train_dataloader) - 1):
+            if is_main_process and (global_step % checkpointing_steps == 0):
                 save_path = os.path.join(output_dir, f"checkpoints")
-                state_dict = {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "state_dict": unet.state_dict(),
-                }
-                if step == len(train_dataloader) - 1:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
-                else:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint.ckpt"))
+                save_path = os.path.join(save_path, f"checkpoint-epoch-{step}.ckpt")
+                save_checkpoint(unet,save_path)
+
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
             # Periodically validation
@@ -471,11 +466,12 @@ def main(
             
                 prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
                 
-                mask = torch.tensor([1, 0, 1, 1]) 
-            
+                masks = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], device=latents.device)
+                input_videos = []
                 # Sample a random batch from the validation dataloader
                 random_val_batch = next(iter(train_dataloader))  # Assuming validation_data is a DataLoader
-                
+                input_videos.append(random_val_batch["pixel_values"])
+
                 # Convert videos to latent space
                 pixel_values = random_val_batch["pixel_values"].to(local_rank)  # Assuming the key is "pixel_values" for the batch
                 video_length = pixel_values.shape[1]
@@ -503,27 +499,27 @@ def main(
                             height       = height,
                             width        = width,
                             latents      = latents,
-                            mask         = mask,
+                            masks         = masks,
                             **validation_data,
                         ).videos
                         print("saving sample")
                         save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
-                        samples.append(sample)
+                        input_videos.append(sample)
                     
-                else:
-                    sample = validation_pipeline(
-                        prompt,
-                        generator           = generator,
-                        height              = height,
-                        width               = width,
-                        num_inference_steps = validation_data.get("num_inference_steps", 25),
-                        guidance_scale      = validation_data.get("guidance_scale", 8.),
-                    ).images[0]
-                    sample = torchvision.transforms.functional.to_tensor(sample)
-                    samples.append(sample)
+                    else:
+                        sample = validation_pipeline(
+                            prompt,
+                            generator           = generator,
+                            height              = height,
+                            width               = width,
+                            num_inference_steps = validation_data.get("num_inference_steps", 25),
+                            guidance_scale      = validation_data.get("guidance_scale", 8.),
+                        ).images[0]
+                        sample = torchvision.transforms.functional.to_tensor(sample)
+                        input_videos.append(sample)
             
                 if not image_finetune:
-                    samples = torch.concat(samples)
+                    samples = torch.concat(input_videos)
                     save_path = f"{output_dir}/samples/sample-{global_step}.gif"
                     save_videos_grid(samples, save_path)
                     
@@ -542,7 +538,16 @@ def main(
             
     dist.destroy_process_group()
 
+def save_checkpoint(unet, mm_path):
+    mm_state_dict = OrderedDict()
+    state_dict = unet.state_dict()
+    for key in state_dict:
+        if "motion_module" in key:
+            # Remove the "module" part from the key
+            new_key = key.replace("module.", "")
+            mm_state_dict[new_key] = state_dict[key]
 
+    torch.save(mm_state_dict, mm_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
