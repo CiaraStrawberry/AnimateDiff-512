@@ -447,7 +447,7 @@ def main(
                 wandb.log({"train_loss": loss.item()}, step=global_step)
                 
             # Save checkpoint
-            if is_main_process and (global_step % checkpointing_steps == 0):
+           if is_main_process and (global_step % checkpointing_steps == 0):
                 save_path = os.path.join(output_dir, f"checkpoints")
                 save_path = os.path.join(save_path, f"checkpoint-epoch-{step}.ckpt")
                 save_checkpoint(unet,save_path)
@@ -470,8 +470,7 @@ def main(
                 input_videos = []
                 # Sample a random batch from the validation dataloader
                 random_val_batch = next(iter(train_dataloader))  # Assuming validation_data is a DataLoader
-                input_videos.append(random_val_batch["pixel_values"])
-
+                
                 # Convert videos to latent space
                 pixel_values = random_val_batch["pixel_values"].to(local_rank)  # Assuming the key is "pixel_values" for the batch
                 video_length = pixel_values.shape[1]
@@ -504,7 +503,7 @@ def main(
                         ).videos
                         print("saving sample")
                         save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
-                        input_videos.append(sample)
+                        samples.append(sample)
                     
                     else:
                         sample = validation_pipeline(
@@ -516,12 +515,14 @@ def main(
                             guidance_scale      = validation_data.get("guidance_scale", 8.),
                         ).images[0]
                         sample = torchvision.transforms.functional.to_tensor(sample)
-                        input_videos.append(sample)
+                        samples.append(sample)
             
                 if not image_finetune:
-                    samples = torch.concat(input_videos)
+                    samples = torch.concat(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.gif"
                     save_videos_grid(samples, save_path)
+                    
+                    
                     
                 else:
                     samples = torch.stack(samples)
@@ -538,6 +539,7 @@ def main(
             
     dist.destroy_process_group()
 
+    
 def save_checkpoint(unet, mm_path):
     mm_state_dict = OrderedDict()
     state_dict = unet.state_dict()
@@ -548,6 +550,7 @@ def save_checkpoint(unet, mm_path):
             mm_state_dict[new_key] = state_dict[key]
 
     torch.save(mm_state_dict, mm_path)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
