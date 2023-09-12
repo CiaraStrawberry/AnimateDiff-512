@@ -14,6 +14,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from safetensors import safe_open
 from typing import Dict, Optional, Tuple
+from collections import OrderedDict
 
 import torch
 import torchvision
@@ -112,7 +113,7 @@ def main(
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 1,
+    gradient_accumulation_steps: int = 4,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -447,7 +448,7 @@ def main(
                 wandb.log({"train_loss": loss.item()}, step=global_step)
                 
             # Save checkpoint
-           if is_main_process and (global_step % checkpointing_steps == 0):
+            if is_main_process and (global_step % checkpointing_steps == 0):
                 save_path = os.path.join(output_dir, f"checkpoints")
                 save_path = os.path.join(save_path, f"checkpoint-epoch-{step}.ckpt")
                 save_checkpoint(unet,save_path)
@@ -489,7 +490,7 @@ def main(
                 # Sample noise that we'll add to the latents
                 #noise = torch.randn_like(latents)
             
-                for idx, prompt in enumerate(prompts):
+                for idx, prompt in enumerate(random_val_batch['text'][:2]):
                     if not image_finetune:
                         sample = validation_pipeline(
                             prompt,
