@@ -26,10 +26,10 @@ import csv, pdb, glob
 from safetensors import safe_open
 import math
 from pathlib import Path
+import cv2
 
-import torchvision.io as io
 
-def load_video_to_tensor(video_path, num_frames_to_extract=16, step=2):
+def load_video_to_tensor(video_path, num_frames_to_extract=16, step=2, target_size=(512, 512)):
     """
     Load a video and convert it to tensor format by extracting a certain number of frames.
     
@@ -37,28 +37,44 @@ def load_video_to_tensor(video_path, num_frames_to_extract=16, step=2):
         video_path (str): Path to the video file.
         num_frames_to_extract (int): The number of frames to extract from the video.
         step (int): Extract every 'step' frame. Default is 1 (i.e., every frame).
+        target_size (tuple): The target height and width for each frame. Default is (512, 512).
 
     Returns:
         torch.Tensor: Tensor with dimensions (batch_size, frames, channels, height, width).
     """
-    metadata = io.read_video_metadata(video_path)
-    total_frames = metadata['video_duration'] * metadata['video_fps']
+    cap = cv2.VideoCapture(video_path)
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     # Compute which frames to start and end on
     frames_to_skip = (total_frames - num_frames_to_extract * step) // (2 * step)
-    start_frame = int(frames_to_skip * step)
-    end_frame = int(start_frame + num_frames_to_extract * step)
+    start_frame = 0
+    frame_idx = start_frame
     
-    video_tensor, _, _ = io.read_video(video_path, start_pts=start_frame/metadata['video_fps'], end_pts=end_frame/metadata['video_fps'], pts_unit='sec')  # Returns video (T, H, W, C)
+    frames = []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open the video at {video_path}")
     
-    # Subsample video by the step
-    video_tensor = video_tensor[::step]
-
-    # Convert video tensor from (T, H, W, C) to (C, T, H, W)
-    video_tensor = video_tensor.permute(3, 0, 1, 2)
+    while len(frames) < num_frames_to_extract and frame_idx < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)  # Set the frame position explicitly
+        ret, frame = cap.read()
+        print(f"Trying to read frame {frame_idx}. Success: {ret}")
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, target_size)  # Resize the frame to the target size
+            tensor_frame = torch.tensor(frame).permute(2, 0, 1).float() / 255.0
+            #alpha_channel = torch.ones_like(tensor_frame[0, :, :])
+            #tensor_frame = torch.cat([tensor_frame, alpha_channel.unsqueeze(0)], dim=0)
+            
+            frames.append(tensor_frame)
+        frame_idx += step
     
-    # Add batch dimension (assuming the video is just one sample)
-    video_tensor = video_tensor.unsqueeze(0)
+    cap.release()
+    print(f"Total frames: {total_frames}, Start frame: {start_frame}, End frame: frame_idx")
+    
+    video_tensor = torch.stack(frames)
+    video_tensor = video_tensor.unsqueeze(0)  # Add batch dimension
     
     return video_tensor
 
@@ -87,7 +103,7 @@ def main(args):
             ### >>> create validation pipeline >>> ###
             tokenizer    = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
             text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder")
-            vae          = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae")            
+            vae          = AutoencoderKL.from_pretrained(args.pretrained_vae_path, subfolder="vae")            
             unet         = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs))
 
             if is_xformers_available(): unet.enable_xformers_memory_efficient_attention()
@@ -144,53 +160,48 @@ def main(args):
             ### <<< create validation pipeline <<< ###
 
             generator = torch.Generator(device='cuda')  # Adjust the device as necessary
-            global_seed = config[config_key].random_seed[0]  # Assuming this works with your configuration
+            #global_seed = config[config_key].random_seed[0]  # Assuming this works with your configuration
+            global_seed = 5
             generator.manual_seed(global_seed)
-            
-            height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-            width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+
             
             samples = []
             sample_idx = 0  # initialize sample index 
             
-            prompts = model_config.prompt
-            n_prompts = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
-            
-            input_video_tensor = load_video_to_tensor(args.video_path)  
-            video_length = input_video_tensor.shape[2]
 
+            prompts      = model_config.prompt
+            n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
+            
+            random_seeds = model_config.get("seed", [-1])
+            random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
+            random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
+            config[config_key].random_seed = []
+                    
+            input_video_tensor = load_video_to_tensor(args.video_path,target_size=(args.W,args.H))  
+            video_length = input_video_tensor.shape[1]
+            print(f"inputvideo tensor shape  {input_video_tensor.shape}")
             with torch.no_grad():
-                input_video_tensor = rearrange(input_video_tensor, "b c f h w -> (b f) c h w")
-                latents = vae.encode(input_video_tensor).latent_dist
+                pixel_values = rearrange(input_video_tensor, "b f c h w -> (b f) c h w").cuda()
+
+                latents = vae.encode(pixel_values).latent_dist
+                
                 latents = latents.sample()
                 latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
 
 
-            
-            # Convert the input video tensor to latents
-            with torch.no_grad():
-                latents = vae.encode(input_video_tensor).latent_dist
-                latents = latents.sample()
-            
             for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
             
-                random_seed = model_config.get("seed", [-1])[prompt_idx]
-                if random_seed != -1: 
-                    generator.manual_seed(random_seed)
-                else:
-                    generator.seed()
-                print(f"current seed: {torch.initial_seed()}")
-            
+                config[config_key].random_seed.append(torch.initial_seed())
+                print(f"latents shape {latents.shape}")
                 # Using the new pipeline
-                sample = validation_pipeline(
+                sample = pipeline(
                     prompt       = prompt,  # Assuming the prompt is just a text string
                     generator    = generator,
-                    video_length = train_data.sample_n_frames,
-                    height       = height,
-                    width        = width,
+                    width               = args.W,
+                    height              = args.H,
+                    video_length        = args.L,
                     latents      = latents,
-                    masks        = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], device='cuda'),  # Adjust the device
-                    **validation_data,
+                    masks        = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], device='cuda'),  # Adjust the device
                 ).videos
             
                 # Saving the Sample
@@ -200,22 +211,23 @@ def main(args):
             
                 sample_idx += 1
 
-    samples = torch.concat(samples)
-    save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)
+    #samples = torch.concat(samples)
+    #save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)
 
-    OmegaConf.save(config, f"{savedir}/config.yaml")
+    #OmegaConf.save(config, f"{savedir}/config.yaml")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_path", type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
+    parser.add_argument("--pretrained_model_path", type=str, default="models/StableDiffusion/stable-diffusion-vae",)
+    parser.add_argument("--pretrained_vae_path",   type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
     parser.add_argument("--inference_config",      type=str, default="configs/inference/inference-v1.yaml")    
-    parser.add_argument("--video_path"),           type=str, default="videos/input.mp4"
+    parser.add_argument("--video_path",            type=str, default="videos/input.mp4")
     parser.add_argument("--config",                type=str, required=True)
     
     parser.add_argument("--L", type=int, default=16 )
-    parser.add_argument("--W", type=int, default=512)
-    parser.add_argument("--H", type=int, default=512)
+    parser.add_argument("--W", type=int, default=256)
+    parser.add_argument("--H", type=int, default=256)
 
     args = parser.parse_args()
     main(args)
