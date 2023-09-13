@@ -492,33 +492,19 @@ def main(
                 # Sample noise that we'll add to the latents
                 #noise = torch.randn_like(latents)
             
-                for idx, prompt in enumerate(random_val_batch['text'][:2]):
-                    if not image_finetune:
-                        sample = validation_pipeline(
-                            prompt,
-                            generator    = generator,
-                            video_length = train_data.sample_n_frames,
-                            height       = height,
-                            width        = width,
-                            latents      = latents,
-                            masks         = masks,
-                            **validation_data,
-                        ).videos
-                        print("saving sample")
-                        save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
-                        samples.append(sample)
-                    
-                    else:
-                        sample = validation_pipeline(
-                            prompt,
-                            generator           = generator,
-                            height              = height,
-                            width               = width,
-                            num_inference_steps = validation_data.get("num_inference_steps", 25),
-                            guidance_scale      = validation_data.get("guidance_scale", 8.),
-                        ).images[0]
-                        sample = torchvision.transforms.functional.to_tensor(sample)
-                        samples.append(sample)
+                sample = validation_pipeline(
+                    prompt       = random_val_batch["text"],
+                    generator    = generator,
+                    video_length = train_data.sample_n_frames,
+                    height       = height,
+                    width        = width,
+                    latents      = latents,
+                    masks         = masks,
+                    **validation_data,
+                ).videos
+                print("saving sample")
+                save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
+                samples.append(sample)
             
                 if not image_finetune:
                     samples = torch.concat(samples)
