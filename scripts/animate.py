@@ -18,6 +18,7 @@ from animatediff.utils.util import save_videos_grid
 from animatediff.utils.convert_from_ckpt import convert_ldm_unet_checkpoint, convert_ldm_clip_checkpoint, convert_ldm_vae_checkpoint
 from animatediff.utils.convert_lora_safetensor_to_diffusers import convert_lora
 from diffusers.utils.import_utils import is_xformers_available
+import torchvision.io as io
 
 from einops import rearrange, repeat
 
@@ -25,6 +26,43 @@ import csv, pdb, glob
 from safetensors import safe_open
 import math
 from pathlib import Path
+
+import torchvision.io as io
+
+def load_video_to_tensor(video_path, num_frames_to_extract=16, step=2):
+    """
+    Load a video and convert it to tensor format by extracting a certain number of frames.
+    
+    Args:
+        video_path (str): Path to the video file.
+        num_frames_to_extract (int): The number of frames to extract from the video.
+        step (int): Extract every 'step' frame. Default is 1 (i.e., every frame).
+
+    Returns:
+        torch.Tensor: Tensor with dimensions (batch_size, frames, channels, height, width).
+    """
+    metadata = io.read_video_metadata(video_path)
+    total_frames = metadata['video_duration'] * metadata['video_fps']
+    
+    # Compute which frames to start and end on
+    frames_to_skip = (total_frames - num_frames_to_extract * step) // (2 * step)
+    start_frame = int(frames_to_skip * step)
+    end_frame = int(start_frame + num_frames_to_extract * step)
+    
+    video_tensor, _, _ = io.read_video(video_path, start_pts=start_frame/metadata['video_fps'], end_pts=end_frame/metadata['video_fps'], pts_unit='sec')  # Returns video (T, H, W, C)
+    
+    # Subsample video by the step
+    video_tensor = video_tensor[::step]
+
+    # Convert video tensor from (T, H, W, C) to (C, T, H, W)
+    video_tensor = video_tensor.permute(3, 0, 1, 2)
+    
+    # Add batch dimension (assuming the video is just one sample)
+    video_tensor = video_tensor.unsqueeze(0)
+    
+    return video_tensor
+
+
 
 
 def main(args):
@@ -105,38 +143,61 @@ def main(args):
             pipeline.to("cuda")
             ### <<< create validation pipeline <<< ###
 
-            prompts      = model_config.prompt
-            n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
+            generator = torch.Generator(device='cuda')  # Adjust the device as necessary
+            global_seed = config[config_key].random_seed[0]  # Assuming this works with your configuration
+            generator.manual_seed(global_seed)
             
-            random_seeds = model_config.get("seed", [-1])
-            random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
-            random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
+            height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+            width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
             
-            config[config_key].random_seed = []
-            for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
-                
-                # manually set random seed for reproduction
-                if random_seed != -1: torch.manual_seed(random_seed)
-                else: torch.seed()
-                config[config_key].random_seed.append(torch.initial_seed())
-                
-                print(f"current seed: {torch.initial_seed()}")
-                print(f"sampling {prompt} ...")
-                sample = pipeline(
-                    prompt,
-                    negative_prompt     = n_prompt,
-                    num_inference_steps = model_config.steps,
-                    guidance_scale      = model_config.guidance_scale,
-                    width               = args.W,
-                    height              = args.H,
-                    video_length        = args.L,
-                ).videos
-                samples.append(sample)
+            samples = []
+            sample_idx = 0  # initialize sample index 
+            
+            prompts = model_config.prompt
+            n_prompts = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
+            
+            input_video_tensor = load_video_to_tensor(args.video_path)  
+            video_length = input_video_tensor.shape[2]
 
-                prompt = "-".join((prompt.replace("/", "").split(" ")[:10]))
-                save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt}.gif")
-                print(f"save to {savedir}/sample/{prompt}.gif")
-                
+            with torch.no_grad():
+                input_video_tensor = rearrange(input_video_tensor, "b c f h w -> (b f) c h w")
+                latents = vae.encode(input_video_tensor).latent_dist
+                latents = latents.sample()
+                latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+
+
+            
+            # Convert the input video tensor to latents
+            with torch.no_grad():
+                latents = vae.encode(input_video_tensor).latent_dist
+                latents = latents.sample()
+            
+            for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
+            
+                random_seed = model_config.get("seed", [-1])[prompt_idx]
+                if random_seed != -1: 
+                    generator.manual_seed(random_seed)
+                else:
+                    generator.seed()
+                print(f"current seed: {torch.initial_seed()}")
+            
+                # Using the new pipeline
+                sample = validation_pipeline(
+                    prompt       = prompt,  # Assuming the prompt is just a text string
+                    generator    = generator,
+                    video_length = train_data.sample_n_frames,
+                    height       = height,
+                    width        = width,
+                    latents      = latents,
+                    masks        = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], device='cuda'),  # Adjust the device
+                    **validation_data,
+                ).videos
+            
+                # Saving the Sample
+                prompt_cleaned = "-".join((prompt.replace("/", "").split(" ")[:10]))
+                save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt_cleaned}.gif")
+                print(f"save to {savedir}/sample/{prompt_cleaned}.gif")
+            
                 sample_idx += 1
 
     samples = torch.concat(samples)
@@ -149,6 +210,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_path", type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
     parser.add_argument("--inference_config",      type=str, default="configs/inference/inference-v1.yaml")    
+    parser.add_argument("--video_path"),           type=str, default="videos/input.mp4"
     parser.add_argument("--config",                type=str, required=True)
     
     parser.add_argument("--L", type=int, default=16 )
