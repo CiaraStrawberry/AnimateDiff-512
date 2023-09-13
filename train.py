@@ -113,7 +113,7 @@ def main(
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 3,
+    gradient_accumulation_steps: int = 1,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -401,7 +401,7 @@ def main(
             #print(f"noise shape {noisy_latents.shape} mask shape {mask.shape} masked_latents {masked_latents.shape}")
             #print(f"latent shape {latent_model_input.shape}")
             #print(f"text embeddings train  shape {encoder_hidden_states.shape}")
-            noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
+            
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -409,8 +409,10 @@ def main(
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            # Compute the loss
-            loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                
+            with torch.cuda.amp.autocast(enabled=mixed_precision_training):
+                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
+                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
 
