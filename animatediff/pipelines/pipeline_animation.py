@@ -286,14 +286,25 @@ class AnimationPipeline(DiffusionPipeline):
     def prepare_mask_latents(
         self, mask, masked_video_latents, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
     ):
+        original_shape = mask.shape
         # Resize the mask to latents shape as we concatenate the mask to the latents
-        #mask = torch.nn.functional.interpolate(
-        #    mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
-        #)
-       # mask = mask.to(device=device, dtype=dtype)
-    #
-        
+        if len(original_shape) == 5:
+            # Reshape the tensor into 4D by merging the first two dimensions
+            mask = mask.view(-1, original_shape[2], original_shape[3], original_shape[4])
     
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        )
+    
+        mask = mask.to(device=device, dtype=dtype)
+        
+        if len(original_shape) == 5:
+            # Reshape the tensor back to 5D
+            mask = mask.view(original_shape[0], original_shape[1], mask.shape[1], mask.shape[2], mask.shape[3])
+        print(f"original shape {original_shape} and new mask {mask.shape}")
+        #mask = mask.unsqueeze(0)
+        mask = mask.permute(0, 2, 1, 3, 4)
+        mask = mask.cuda()
         # Duplicate mask and masked_video_latents for each generation per prompt
         if mask.shape[0] < batch_size:
             if not batch_size % mask.shape[0] == 0:
@@ -397,6 +408,7 @@ class AnimationPipeline(DiffusionPipeline):
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
+        masked_latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "tensor",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
@@ -434,34 +446,12 @@ class AnimationPipeline(DiffusionPipeline):
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
         print (f"initial text shape {text_embeddings.shape} nd class {do_classifier_free_guidance}")
-        
-        
-        # Extend the mask_1d to the video_length using modulo operation
-        #mask_expanded = masks[:, None, None, None]  # Adds 3 additional dimensions, giving a shape of [16, 1, 1, 1]
-        #mask_expanded = mask_expanded[None, :]
-
-        masks = masks[None, None, :, None, None]
-        mask_expanded = masks.expand(latents.shape[0], latents.shape[1], -1, latents.shape[3], latents.shape[4])
-        mask_single_channel = masks.expand(latents.shape[0], 1, -1, latents.shape[3], latents.shape[4])
-        # Repeat the mask to match the dimensions of latents
-        #mask_expanded = mask_expanded.expand(latents.shape[0], -1, 1, latents.shape[3], latents.shape[4])
-
-
-    
-        # Invert the mask (if needed)
-        inverted_masks = 1 - mask_expanded
-        
-        print(latents.shape)
-        print(masks.shape)
-        
-        # Apply the mask to latents
-        masked_latents = latents * inverted_masks
 
     
         print(masked_latents.shape)
         mask, masked_latents_input = self.prepare_mask_latents(
-            mask_single_channel,
-            masked_latents,  # Assuming 'masked_video' is the variable you have or passed to the __call__ method
+            masks,
+            masked_latents,  
             batch_size,
             height,
             width,
@@ -504,6 +494,7 @@ class AnimationPipeline(DiffusionPipeline):
 
                 # Concatenate latents, masks, and masked latents based on U-Net's expected input channels
                 #if num_channels_unet == 9:
+                
                 #print (f"latent {latent_model_input.shape} mask {mask.shape} masked {masked_latents_input.shape}")
                 latent_model_input = torch.cat([latent_model_input, mask, masked_latents_input], dim=1)
               
