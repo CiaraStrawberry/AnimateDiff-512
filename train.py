@@ -169,32 +169,59 @@ def main(
     #vae = AutoencoderKL
     tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
-    if not image_finetune:
-        unet = UNet3DConditionModel.from_pretrained_2d(
-            pretrained_model_path, subfolder="unet", 
-            unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
-        )
-    else:
-        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+    unet = UNet3DConditionModel.from_pretrained_2d(
+        pretrained_model_path, subfolder="unet", 
+        unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
+    )
+
         
+    missing_keys_initial, _ = unet.load_state_dict(unet.state_dict(), strict=False)
+    loaded__checkpoint_params_names = ""
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
-        unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
-        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
-        state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
+        print(f"from checkpoint: {unet_checkpoint_path}")
+        checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
+    
+        if "global_step" in checkpoint:
+            zero_rank_print(f"global_step: {checkpoint['global_step']}")
+    
+        loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    
+        # Check for "module." prefix and remove
+        new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                                 for key, value in loaded_state_dict.items()}
+    
         current_model_dict = unet.state_dict()
-        #loaded_state_dict = torch.load(unet_checkpoint_path, map_location='cpu')
-        new_state_dict={k:v if v.size()==current_model_dict[k].size()  else  current_model_dict[k] for k,v in zip(current_model_dict.keys(), unet_checkpoint_path.values())}
+
         
-        m, u = unet.load_state_dict(new_state_dict, strict=False)
-        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
+        loaded__checkpoint_params_names = set(loaded_state_dict.keys())
+
         
+        #new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
+        #                  for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
+    
+        missing_after_load, unexpected = unet.load_state_dict(new_loaded_state_dict, strict=False)
+        print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
+        assert len(unexpected) == 0
+    
+        if set(missing_after_load).issubset(set(missing_keys_initial)):
+            print("All initially missing keys were filled by the checkpoint!")
+        else:
+            still_missing = set(missing_keys_initial).intersection(set(missing_after_load))
+            print(f"Some keys are still missing after loading the checkpoint: {still_missing}")
+
+        # If the checkpoint has optimizer state, load it
+        #if "optimizer_state_dict" in checkpoint:
+        #    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    
+        # If the checkpoint has an epoch state, you can also retrieve it
+        if "epoch" in checkpoint:
+            epoch = checkpoint["epoch"]
+            
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    
+    #tokenizer.requires_grad_(False)
     # Set unet trainable parameters
     unet.requires_grad_(False)
     for name, param in unet.named_parameters():
@@ -202,8 +229,30 @@ def main(
             if trainable_module_name in name:
                 param.requires_grad = True
                 break
-            
+
+                
+        
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    trainable_params_names = [(name, param) for name, param in unet.named_parameters() if param.requires_grad]
+    trainable_params_set = set([name for name, _ in trainable_params_names])
+
+    #print(f"Trainable params names: {[name for name, _ in trainable_params_names]}")
+    in_checkpoint_not_trainable = loaded__checkpoint_params_names.difference(trainable_params_set)
+    print(f"Parameters in loaded checkpoint but not in trainable params: {in_checkpoint_not_trainable}")
+    #
+    # Determine which parameters are in the trainable_params but not in the loaded checkpoint
+    in_trainable_not_checkpoint = trainable_params_set.difference(loaded__checkpoint_params_names)
+    print(f"Parameters in trainable params but not in loaded checkpoint: {in_trainable_not_checkpoint}")
+    all_params_in_unet = set([name for name, _ in unet.named_parameters()])
+    
+    # Check if the parameters from the checkpoint are in unet
+    in_checkpoint_but_not_in_unet = in_checkpoint_not_trainable.difference(all_params_in_unet)
+    
+    #if not in_checkpoint_but_not_in_unet:
+    #    print("All parameters from the checkpoint are present in the unet model.")
+    #else:
+    #    print(f"Parameters present in checkpoint but not in the unet model: {all_params_in_unet}")
+
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=learning_rate,
@@ -479,8 +528,8 @@ def main(
             # Save checkpoint
             if is_main_process and (global_step % checkpointing_steps == 0):
                 save_path = os.path.join(output_dir, f"checkpoints")
-                save_path = os.path.join(save_path, f"checkpoint-epoch-{step}.ckpt")
-                save_checkpoint(unet,save_path)
+                save_path = os.path.join(save_path, f"checkpoint-epoch-{global_step}.ckpt")
+                save_checkpoint(unet,optimizer,trainable_params,save_path)
 
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
@@ -581,16 +630,22 @@ def main(
     dist.destroy_process_group()
 
     
-def save_checkpoint(unet, mm_path):
-    mm_state_dict = OrderedDict()
+def save_checkpoint(unet, optimizer, trainable_params, mm_path, epoch=None, global_step=None):
+    # Convert the list of trainable parameters to a set for faster lookup
+    trainable_params_set = set(id(p) for p in trainable_params)
+    
+    # Extract the current state of the UNet model
     state_dict = unet.state_dict()
-    for key in state_dict:
-        if "motion_module" in key:
-            # Remove the "module" part from the key
-            new_key = key.replace("module.", "")
-            mm_state_dict[new_key] = state_dict[key]
+    
+    checkpoint = {
+        'state_dict': state_dict, 
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'global_step': global_step
+    }
+    
+    torch.save(checkpoint, mm_path)
 
-    torch.save(mm_state_dict, mm_path)
 
 
 if __name__ == "__main__":
