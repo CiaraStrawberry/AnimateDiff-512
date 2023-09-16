@@ -113,7 +113,7 @@ def main(
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 1,
+    gradient_accumulation_steps: int = 3,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -163,7 +163,7 @@ def main(
     print(pretrained_model_path)
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    vae_Dir = "/workspace/AnimateDiff-512/models/StableDiffusion-vae"
+    vae_Dir = "/home/holo/AnimateDiff-512/models/StableDiffusionVae"
     
     vae          = AutoencoderKL.from_pretrained(vae_Dir, subfolder="vae")
     #vae = AutoencoderKL
