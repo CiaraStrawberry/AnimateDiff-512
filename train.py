@@ -106,14 +106,14 @@ def main(
     lr_scheduler: str = "constant",
 
     trainable_modules: Tuple[str] = (None, ),
-    num_workers: int = 32,
+    num_workers: int = 24,
     train_batch_size: int = 1,
     adam_beta1: float = 0.9,
     adam_beta2: float = 0.999,
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 3,
+    gradient_accumulation_steps: int = 2,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -174,84 +174,67 @@ def main(
         unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
     )
 
+
         
     missing_keys_initial, _ = unet.load_state_dict(unet.state_dict(), strict=False)
     loaded__checkpoint_params_names = ""
     # Load pretrained unet weights
-    if unet_checkpoint_path != "":
-        print(f"from checkpoint: {unet_checkpoint_path}")
-        checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
-    
-        if "global_step" in checkpoint:
-            zero_rank_print(f"global_step: {checkpoint['global_step']}")
-    
-        loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-    
-        # Check for "module." prefix and remove
-        new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
-                                 for key, value in loaded_state_dict.items()}
-    
-        current_model_dict = unet.state_dict()
 
-        
-        loaded__checkpoint_params_names = set(loaded_state_dict.keys())
+    print(f"from checkpoint: {unet_checkpoint_path}")
+    checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
 
-        
-        #new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
-        #                  for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
-    
-        missing_after_load, unexpected = unet.load_state_dict(new_loaded_state_dict, strict=False)
-        print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
-        assert len(unexpected) == 0
-    
-        if set(missing_after_load).issubset(set(missing_keys_initial)):
-            print("All initially missing keys were filled by the checkpoint!")
-        else:
-            still_missing = set(missing_keys_initial).intersection(set(missing_after_load))
-            print(f"Some keys are still missing after loading the checkpoint: {still_missing}")
+    if "global_step" in checkpoint:
+        zero_rank_print(f"global_step: {checkpoint['global_step']}")
 
-        # If the checkpoint has optimizer state, load it
-        #if "optimizer_state_dict" in checkpoint:
-        #    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+
+    # Check for "module." prefix and remove
+    new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                             for key, value in loaded_state_dict.items()}
+
+    current_model_dict = unet.state_dict()
+
     
-        # If the checkpoint has an epoch state, you can also retrieve it
-        if "epoch" in checkpoint:
-            epoch = checkpoint["epoch"]
+    loaded__checkpoint_params_names = set(loaded_state_dict.keys())
+
+    
+    new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
+                      for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
+
+    missing_after_load, unexpected = unet.load_state_dict(new_state_dict, strict=False)
+    print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
+    assert len(unexpected) == 0
+
+   # if set(missing_after_load).issubset(set(missing_keys_initial)):
+    #    print("All initially missing keys were filled by the checkpoint!")
+   # else:
+   #     still_missing = set(missing_keys_initial).intersection(set(missing_after_load))
+    #    print(f"Some keys are still missing after loading the checkpoint: {still_missing}")
+
+    # If the checkpoint has optimizer state, load it
+
+
+    # If the checkpoint has an epoch state, you can also retrieve it
+    if "epoch" in checkpoint:
+        epoch = checkpoint["epoch"]
             
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     #tokenizer.requires_grad_(False)
     # Set unet trainable parameters
-    unet.requires_grad_(False)
-    for name, param in unet.named_parameters():
-        for trainable_module_name in trainable_modules:
-            if trainable_module_name in name:
-                param.requires_grad = True
-                break
+    unet.requires_grad_(True)
+    #for name, param in unet.named_parameters():
+    #    for trainable_module_name in trainable_modules:
+    #        if trainable_module_name in name:
+    #            param.requires_grad = True
+    #            break
 
                 
         
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
     trainable_params_names = [(name, param) for name, param in unet.named_parameters() if param.requires_grad]
     trainable_params_set = set([name for name, _ in trainable_params_names])
-
-    #print(f"Trainable params names: {[name for name, _ in trainable_params_names]}")
-    in_checkpoint_not_trainable = loaded__checkpoint_params_names.difference(trainable_params_set)
-    print(f"Parameters in loaded checkpoint but not in trainable params: {in_checkpoint_not_trainable}")
-    #
-    # Determine which parameters are in the trainable_params but not in the loaded checkpoint
-    in_trainable_not_checkpoint = trainable_params_set.difference(loaded__checkpoint_params_names)
-    print(f"Parameters in trainable params but not in loaded checkpoint: {in_trainable_not_checkpoint}")
-    all_params_in_unet = set([name for name, _ in unet.named_parameters()])
-    
-    # Check if the parameters from the checkpoint are in unet
-    in_checkpoint_but_not_in_unet = in_checkpoint_not_trainable.difference(all_params_in_unet)
-    
-    #if not in_checkpoint_but_not_in_unet:
-    #    print("All parameters from the checkpoint are present in the unet model.")
-    #else:
-    #    print(f"Parameters present in checkpoint but not in the unet model: {all_params_in_unet}")
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -260,6 +243,18 @@ def main(
         weight_decay=adam_weight_decay,
         eps=adam_epsilon,
     )
+
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"newlr = {learning_rate}")
+        for g in optimizer.param_groups:
+            g['lr'] = learning_rate
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                  state[k] = v.to(device)
+
 
     if is_main_process:
         zero_rank_print(f"trainable params number: {len(trainable_params)}")
@@ -370,7 +365,8 @@ def main(
         for step, batch in enumerate(train_dataloader):
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
-                
+            for g in optimizer.param_groups:
+                g['lr'] = learning_rate    
             # Data batch sanity check
             if epoch == first_epoch and step == 0:
                 
@@ -621,7 +617,7 @@ def main(
     
                 logging.info(f"Saved samples to {save_path}")
                 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "lr": optimizer.param_groups[0]['lr']}
             progress_bar.set_postfix(**logs)
             
             if global_step >= max_train_steps:
