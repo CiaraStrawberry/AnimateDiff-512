@@ -29,54 +29,26 @@ from pathlib import Path
 import cv2
 
 
-def load_video_to_tensor(video_path, num_frames_to_extract=16, step=2, target_size=(512, 512)):
+def load_image_to_tensor(image_path, target_size=(512, 512)):
     """
-    Load a video and convert it to tensor format by extracting a certain number of frames.
+    Load an image and convert it to tensor format.
     
     Args:
-        video_path (str): Path to the video file.
-        num_frames_to_extract (int): The number of frames to extract from the video.
-        step (int): Extract every 'step' frame. Default is 1 (i.e., every frame).
-        target_size (tuple): The target height and width for each frame. Default is (512, 512).
+        image_path (str): Path to the image file.
+        target_size (tuple): The target height and width for the image. Default is (512, 512).
 
     Returns:
-        torch.Tensor: Tensor with dimensions (batch_size, frames, channels, height, width).
+        torch.Tensor: Tensor with dimensions (channels, height, width).
     """
-    cap = cv2.VideoCapture(video_path)
-    
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Compute which frames to start and end on
-    frames_to_skip = (total_frames - num_frames_to_extract * step) // (2 * step)
-    start_frame = 0
-    frame_idx = start_frame
-    
-    frames = []
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open the video at {video_path}")
-    
-    while len(frames) < num_frames_to_extract and frame_idx < total_frames:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)  # Set the frame position explicitly
-        ret, frame = cap.read()
-        print(f"Trying to read frame {frame_idx}. Success: {ret}")
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, target_size)  # Resize the frame to the target size
-            tensor_frame = torch.tensor(frame).permute(2, 0, 1).float() / 255.0
-            #alpha_channel = torch.ones_like(tensor_frame[0, :, :])
-            #tensor_frame = torch.cat([tensor_frame, alpha_channel.unsqueeze(0)], dim=0)
-            
-            frames.append(tensor_frame)
-        frame_idx += step
-    
-    cap.release()
-    print(f"Total frames: {total_frames}, Start frame: {start_frame}, End frame: frame_idx")
-    
-    video_tensor = torch.stack(frames)
-    video_tensor = video_tensor.unsqueeze(0)  # Add batch dimension
-    
-    return video_tensor
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not load the image at {image_path}")
+
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, target_size)
+    tensor_image = torch.tensor(image).permute(2, 0, 1).float() / 255.0
+    return tensor_image.unsqueeze(0)  # Add batch dimension
+
 
 
 
@@ -177,16 +149,17 @@ def main(args):
             random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
             config[config_key].random_seed = []
                     
-            input_video_tensor = load_video_to_tensor(args.video_path,target_size=(args.W,args.H))  
-            video_length = input_video_tensor.shape[1]
+            input_image_tensor = load_image_to_tensor(args.image_path, target_size=(args.W, args.H))
+            video_length = args.L
+            input_image_tensor = input_image_tensor.repeat(video_length, 1, 1, 1)  # Repeat the image tensor for all frames
+            masks = torch.ones(video_length, device='cuda')
+
             print(f"inputvideo tensor shape  {input_video_tensor.shape}")
             with torch.no_grad():
-                pixel_values = rearrange(input_video_tensor, "b f c h w -> (b f) c h w").cuda()
-
+                pixel_values = rearrange(input_image_tensor, "f c h w -> (f) c h w").cuda()
                 latents = vae.encode(pixel_values).latent_dist
-                
                 latents = latents.sample()
-                latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
 
 
             for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
@@ -201,7 +174,7 @@ def main(args):
                     height              = args.H,
                     video_length        = args.L,
                     latents      = latents,
-                    masks        = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], device='cuda'),  # Adjust the device
+                    masks        = masks,  # Adjust the device
                 ).videos
             
                 # Saving the Sample
