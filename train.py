@@ -74,6 +74,23 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     return local_rank
 
 
+def find_nearest_unmasked(mask_flag):
+    # Find the indices of the masked and unmasked frames
+    masked_indices = torch.where(mask_flag)[0]
+    unmasked_indices = torch.where(~mask_flag)[0]
+
+    nearest_unmasked = []
+
+    for idx in masked_indices:
+        # Find the distance to all unmasked frames
+        distance_to_unmasked = torch.abs(unmasked_indices - idx)
+        
+        # Get the index of the nearest unmasked frame
+        nearest_idx = unmasked_indices[torch.argmin(distance_to_unmasked)]
+        nearest_unmasked.append(nearest_idx)
+
+    return torch.tensor(nearest_unmasked)
+
 
 def main(
     image_finetune: bool,
@@ -223,12 +240,12 @@ def main(
     text_encoder.requires_grad_(False)
     #tokenizer.requires_grad_(False)
     # Set unet trainable parameters
-    unet.requires_grad_(True)
-    #for name, param in unet.named_parameters():
-    #    for trainable_module_name in trainable_modules:
-    #        if trainable_module_name in name:
-    #            param.requires_grad = True
-    #            break
+    unet.requires_grad_(False)
+    for name, param in unet.named_parameters():
+        for trainable_module_name in trainable_modules:
+            if trainable_module_name in name:
+                param.requires_grad = True
+                break
 
                 
         
@@ -388,22 +405,16 @@ def main(
             video_length = pixel_values.shape[1]
 
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
-            mask_proportion = torch.rand(1).item()
-            mask_flag = torch.rand(pixel_values.shape[0]) < mask_proportion
-
-            # Create a single channel mask for the images
-            single_channel_mask = torch.zeros(pixel_values.shape[0], 1, *pixel_values.shape[2:])
-
+            mask_first_frame = torch.zeros_like(pixel_values[0])
+            mask_first_frame[..., :] = 1  # This creates a mask for the first frame
+            
+            # Apply the mask to the first frame to get the masked version
+            masked_first_frame = pixel_values[0].clone()
+            masked_pixel_values = pixel_values.clone()
+            # 2. Replace every frame with the masked first frame
             for i in range(pixel_values.shape[0]):
-                if mask_flag[i]:
-                    single_channel_mask[i, ...] = 1
-
-            # Expand the single channel mask to match the channel dimensions of pixel_values
-            image_mask = single_channel_mask.expand_as(pixel_values).to(pixel_values.device)
-
-            # Apply the mask to the pixel_values to black out the masked regions
-            masked_pixel_values = pixel_values * (1 - image_mask)
-
+                masked_pixel_values[i, ...] = masked_first_frame
+                
             with torch.no_grad():
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
@@ -447,18 +458,11 @@ def main(
 
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
             
-            
-            if single_channel_mask.dim() == 5:  # Confirming it has 5 dimensions
-                single_channel_mask = single_channel_mask.squeeze(-1)  # Squeezing the last dimension
-            #print(f"single channels shape {single_channel_mask.shape}")
-            latents_shape = latents.shape[-3:]
-            if single_channel_mask.dim() == 4:  # 4D, so might need to add a depth/length dimension
-                single_channel_mask = single_channel_mask.unsqueeze(2)  # Assuming the depth/length is the missing dimension
-            elif single_channel_mask.dim() > 5:
-                raise ValueError("Unexpected number of dimensions in single_channel_mask")
-            
-            #print(f"single channels shape {single_channel_mask.shape}")
-            mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
+            latents_shape = latents.shape[-3:]  # (Depth/Length, Height, Width)
+            mask = torch.ones((bsz, 1) + latents_shape, device=latents.device)
+
+         
+            #mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
             #print(f"mask after interp {mask.shape}")
             mask = mask.cuda()
 
@@ -534,68 +538,60 @@ def main(
                 samples = []
                 pixel_values = batch["pixel_values"].to(local_rank)
                 video_length = pixel_values.shape[1]
-                print(f"pixel values shape {pixel_values.shape}")
+            
+                # Ensure every frame is the first frame
+                first_frame = pixel_values[:, 0:1, :, :, :]
+                pixel_values = first_frame.repeat(1, video_length, 1, 1, 1)
+            
                 generator = torch.Generator(device=latents.device)
                 generator.manual_seed(global_seed)
-
+            
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-                width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-
+                width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+            
                 prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
+                first_frame = pixel_values[:, 0, :, :, :]
+                first_frame_repeated = first_frame.unsqueeze(1).repeat(1, video_length, 1, 1, 1)
 
-                #mask_values = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], device=latents.device)
-
-                # Randomly decide which frames to mask out completely.
-                num_frames = pixel_values.shape[1]
-                mask_frames = torch.randint(0, 2, (num_frames,)).bool()
-
-                # Create a mask tensor based on mask_frames.
-                masks = torch.zeros_like(pixel_values[:, :, 0:1, :, :])
-                for i, frame_mask in enumerate(mask_frames):
-                    if frame_mask:
-                        masks[:, i, :, :, :] = 1
-                print(masks.shape)
-                inverted_mask = 1 - masks
-
+                # Mask values so everything is masked
+                masks = torch.ones_like(pixel_values[:, :, 0:1, :, :])
+                #inverted_mask = 1 - masks
+            
                 # Convert videos to latent space
-               
                 with torch.no_grad():
-                    if not image_finetune:
+                    masked_pixel_values = first_frame_repeated
 
-                        masked_pixel_values = pixel_values * inverted_mask
+            
+                    if not image_finetune:
                         pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                         masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
-                        #masks = masks.unsqueeze(0)
-                        # Generate masked_latents
-                        print(f"pixel values {pixel_values.shape} mask {inverted_mask.shape}")
-                        
+            
                         masked_latents = vae.encode(masked_pixel_values).latent_dist
                         masked_latents = masked_latents.sample()
                         masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
-                        
+            
                         latents = vae.encode(pixel_values).latent_dist
                         latents = latents.sample()
                         latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
                     else:
                         latents = vae.encode(pixel_values).latent_dist
                         latents = latents.sample()
-                        
+            
                         # For image_finetune, we'll also need to generate masked_latents
-                        masked_pixel_values = pixel_values * inverted_mask
                         masked_latents = vae.encode(masked_pixel_values).latent_dist
                         masked_latents = masked_latents.sample()
-
+            
                     latents = latents * 0.18215
-
+            
                 sample = validation_pipeline(
-                    prompt       = batch["text"],
-                    generator    = generator,
-                    video_length = train_data.sample_n_frames,
-                    height       = height,
-                    width        = width,
-                    latents      = latents,
-                    masks        = masks,
-                    masked_latents = masked_latents,  # Pass the masked_latents to the validation pipeline
+                    prompt=batch["text"],
+                    generator=generator,
+                    video_length=train_data.sample_n_frames,
+                    height=height,
+                    width=width,
+                    latents=latents,
+                    masks=masks,
+                    masked_latents=masked_latents,  # Pass the masked_latents to the validation pipeline
                     **validation_data,
                 ).videos
 
