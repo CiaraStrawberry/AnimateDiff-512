@@ -130,8 +130,10 @@ def main(args):
                     
                     # import pdb
                     # pdb.set_trace()
+
                #     if is_lora:
               #         pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+
                     pipeline.to("cuda")
                     ### <<< create validation pipeline <<< ###
 
@@ -163,12 +165,14 @@ def main(args):
                         latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
 
                         # Generate the masked pixel values and latents
+
                         first_frame = input_image_tensor.unsqueeze(0)
                         print(f"first frame shape {first_frame.shape}")
                         masked_latents = vae.encode(rearrange(first_frame, "b f c h w -> (b f) c h w")).latent_dist
                         masked_latents = masked_latents.sample()
                         masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
                        # masked_latents = masked_latents.unsqueeze(0)
+
                     for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
                         
                         config[config_key].random_seed.append(torch.initial_seed())
