@@ -100,38 +100,38 @@ def main(args):
             
             # 1.2 T2I
             if model_config.path != "":
-                if model_config.path.endswith(".ckpt"):
-                    state_dict = torch.load(model_config.path)
-                    pipeline.unet.load_state_dict(state_dict)
-                    
-                elif model_config.path.endswith(".safetensors"):
-                    state_dict = {}
-                    with safe_open(model_config.path, framework="pt", device="cpu") as f:
-                        for key in f.keys():
-                            state_dict[key] = f.get_tensor(key)
-                            
-                    is_lora = all("lora" in k for k in state_dict.keys())
-                    if not is_lora:
-                        base_state_dict = state_dict
-                    else:
-                        base_state_dict = {}
-                        with safe_open(model_config.base, framework="pt", device="cpu") as f:
-                            for key in f.keys():
-                                base_state_dict[key] = f.get_tensor(key)                
+           #     if model_config.path.endswith(".ckpt"):
+            #        state_dict = torch.load(model_config.path)
+             #       pipeline.unet.load_state_dict(state_dict)
+              #      
+              #  elif model_config.path.endswith(".safetensors"):
+              #      state_dict = {}
+              #      with safe_open(model_config.path, framework="pt", device="cpu") as f:
+              #          for key in f.keys():
+              #              state_dict[key] = f.get_tensor(key)
+              #              
+              #      is_lora = all("lora" in k for k in state_dict.keys())
+              #      if not is_lora:
+              ##          base_state_dict = state_dict
+              #      else:
+              #          base_state_dict = {}
+              #          with safe_open(model_config.base, framework="pt", device="cpu") as f:
+               #             for key in f.keys():
+               #                 base_state_dict[key] = f.get_tensor(key)                
                     
                     # vae
-                    converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
-                    pipeline.vae.load_state_dict(converted_vae_checkpoint)
+               #     converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
+               #     pipeline.vae.load_state_dict(converted_vae_checkpoint)
                     # unet
-                    converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
-                    pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
+               #     converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
+              #      pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
                     # text_model
-                    pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
+              #      pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
                     
                     # import pdb
                     # pdb.set_trace()
-                    if is_lora:
-                        pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+               #     if is_lora:
+              #         pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
                     pipeline.to("cuda")
                     ### <<< create validation pipeline <<< ###
 
@@ -163,12 +163,12 @@ def main(args):
                         latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
 
                         # Generate the masked pixel values and latents
-                        first_frame = input_image_tensor[0].unsqueeze(0)
-                        masked_pixel_values = first_frame.repeat(video_length, 1, 1, 1)
-                        masked_latents = vae.encode(rearrange(masked_pixel_values, "f c h w -> (f) c h w")).latent_dist
+                        first_frame = input_image_tensor.unsqueeze(0)
+                        print(f"first frame shape {first_frame.shape}")
+                        masked_latents = vae.encode(rearrange(first_frame, "b f c h w -> (b f) c h w")).latent_dist
                         masked_latents = masked_latents.sample()
-                        masked_latents = rearrange(masked_latents, "(f) c h w -> c f h w", f=video_length)
-                        masked_latents = masked_latents.unsqueeze(0)
+                        masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
+                       # masked_latents = masked_latents.unsqueeze(0)
                     for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
                         
                         config[config_key].random_seed.append(torch.initial_seed())
@@ -181,7 +181,7 @@ def main(args):
                             width=args.W,
                             height=args.H,
                             video_length=args.L,
-                            latents=latents,
+                            latents=None,
                             masks=masks,
                             masked_latents=masked_latents   # Passing the masked latents
                         ).videos
