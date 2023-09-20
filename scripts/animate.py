@@ -89,100 +89,109 @@ def main(args):
             # 1. unet ckpt
             # 1.1 motion module
             motion_module_state_dict = torch.load(motion_module, map_location="cpu")
+            motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
+            new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                             for key, value in motion_module_state_dict.items()}
+            motion_module_state_dict = new_loaded_state_dict
             if "global_step" in motion_module_state_dict: func_args.update({"global_step": motion_module_state_dict["global_step"]})
             missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
+            print(f"results ", missing,unexpected)
             assert len(unexpected) == 0
             
             # 1.2 T2I
             if model_config.path != "":
-                if model_config.path.endswith(".ckpt"):
-                    state_dict = torch.load(model_config.path)
-                    pipeline.unet.load_state_dict(state_dict)
-                    
-                elif model_config.path.endswith(".safetensors"):
-                    state_dict = {}
-                    with safe_open(model_config.path, framework="pt", device="cpu") as f:
-                        for key in f.keys():
-                            state_dict[key] = f.get_tensor(key)
-                            
-                    is_lora = all("lora" in k for k in state_dict.keys())
-                    if not is_lora:
-                        base_state_dict = state_dict
-                    else:
-                        base_state_dict = {}
-                        with safe_open(model_config.base, framework="pt", device="cpu") as f:
-                            for key in f.keys():
-                                base_state_dict[key] = f.get_tensor(key)                
+           #     if model_config.path.endswith(".ckpt"):
+            #        state_dict = torch.load(model_config.path)
+             #       pipeline.unet.load_state_dict(state_dict)
+              #      
+              #  elif model_config.path.endswith(".safetensors"):
+              #      state_dict = {}
+              #      with safe_open(model_config.path, framework="pt", device="cpu") as f:
+              #          for key in f.keys():
+              #              state_dict[key] = f.get_tensor(key)
+              #              
+              #      is_lora = all("lora" in k for k in state_dict.keys())
+              #      if not is_lora:
+              ##          base_state_dict = state_dict
+              #      else:
+              #          base_state_dict = {}
+              #          with safe_open(model_config.base, framework="pt", device="cpu") as f:
+               #             for key in f.keys():
+               #                 base_state_dict[key] = f.get_tensor(key)                
                     
                     # vae
-                    converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
-                    pipeline.vae.load_state_dict(converted_vae_checkpoint)
+               #     converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
+               #     pipeline.vae.load_state_dict(converted_vae_checkpoint)
                     # unet
-                    converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
-                    pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
+               #     converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
+              #      pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
                     # text_model
-                    pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
+              #      pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
                     
                     # import pdb
                     # pdb.set_trace()
-                    if is_lora:
-                        pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+               #     if is_lora:
+              #         pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+                    pipeline.to("cuda")
+                    ### <<< create validation pipeline <<< ###
 
-            pipeline.to("cuda")
-            ### <<< create validation pipeline <<< ###
+                    generator = torch.Generator(device='cuda')  # Adjust the device as necessary
+                    global_seed = 5
+                    generator.manual_seed(global_seed)
 
-            generator = torch.Generator(device='cuda')  # Adjust the device as necessary
-            #global_seed = config[config_key].random_seed[0]  # Assuming this works with your configuration
-            global_seed = 5
-            generator.manual_seed(global_seed)
+                    samples = []
+                    sample_idx = 0  # initialize sample index 
 
-            
-            samples = []
-            sample_idx = 0  # initialize sample index 
-            
+                    prompts = model_config.prompt
+                    n_prompts = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
 
-            prompts      = model_config.prompt
-            n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
-            
-            random_seeds = model_config.get("seed", [-1])
-            random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
-            random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
-            config[config_key].random_seed = []
-                    
-            input_image_tensor = load_image_to_tensor(args.image_path, target_size=(args.W, args.H))
-            video_length = args.L
-            input_image_tensor = input_image_tensor.repeat(video_length, 1, 1, 1)  # Repeat the image tensor for all frames
-            masks = torch.ones(video_length, device='cuda')
+                    random_seeds = model_config.get("seed", [-1])
+                    random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
+                    random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
+                    config[config_key].random_seed = []
 
-            print(f"inputvideo tensor shape  {input_video_tensor.shape}")
-            with torch.no_grad():
-                pixel_values = rearrange(input_image_tensor, "f c h w -> (f) c h w").cuda()
-                latents = vae.encode(pixel_values).latent_dist
-                latents = latents.sample()
-                latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
+                    input_image_tensor = load_image_to_tensor(args.image_path, target_size=(args.W, args.H))
+                    video_length = args.L
+                    input_image_tensor = input_image_tensor.repeat(video_length, 1, 1, 1).cuda()  # Repeat the image tensor for all frames, also move it to GPU
+                    masks = torch.ones(1,video_length, 1, args.H, args.W, device='cuda')  # Expanded the mask shape to match the latent's
 
+                    print(f"input image tensor shape: {input_image_tensor.shape}")
+                    with torch.no_grad():
+                        pixel_values = rearrange(input_image_tensor, "f c h w -> (f) c h w")
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
+                        latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
 
-            for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
-            
-                config[config_key].random_seed.append(torch.initial_seed())
-                print(f"latents shape {latents.shape}")
-                # Using the new pipeline
-                sample = pipeline(
-                    prompt       = prompt,  # Assuming the prompt is just a text string
-                    generator    = generator,
-                    width               = args.W,
-                    height              = args.H,
-                    video_length        = args.L,
-                    latents      = latents,
-                    masks        = masks,  # Adjust the device
-                ).videos
-            
-                # Saving the Sample
-                prompt_cleaned = "-".join((prompt.replace("/", "").split(" ")[:10]))
-                save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt_cleaned}.gif")
-                print(f"save to {savedir}/sample/{prompt_cleaned}.gif")
-            
-                sample_idx += 1
+                        # Generate the masked pixel values and latents
+                        first_frame = input_image_tensor.unsqueeze(0)
+                        print(f"first frame shape {first_frame.shape}")
+                        masked_latents = vae.encode(rearrange(first_frame, "b f c h w -> (b f) c h w")).latent_dist
+                        masked_latents = masked_latents.sample()
+                        masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
+                       # masked_latents = masked_latents.unsqueeze(0)
+                    for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
+                        
+                        config[config_key].random_seed.append(torch.initial_seed())
+                        print(f"latents shape: {latents.shape}")
+
+                        # Using the pipeline
+                        sample = pipeline(
+                            prompt=prompt,
+                            generator=generator,
+                            width=args.W,
+                            height=args.H,
+                            video_length=args.L,
+                            latents=None,
+                            masks=masks,
+                            masked_latents=masked_latents   # Passing the masked latents
+                        ).videos
+
+                        # Saving the Sample
+                        prompt_cleaned = "-".join((prompt.replace("/", "").split(" ")[:10]))
+                        save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt_cleaned}.gif")
+                        print(f"Saved to {savedir}/sample/{prompt_cleaned}.gif")
+
+                        sample_idx += 1
 
     #samples = torch.concat(samples)
     #save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)
@@ -195,7 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_model_path", type=str, default="models/StableDiffusion/stable-diffusion-vae",)
     parser.add_argument("--pretrained_vae_path",   type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
     parser.add_argument("--inference_config",      type=str, default="configs/inference/inference-v1.yaml")    
-    parser.add_argument("--video_path",            type=str, default="videos/input.mp4")
+    parser.add_argument("--image_path",            type=str, default="videos/input.mp4")
     parser.add_argument("--config",                type=str, required=True)
     
     parser.add_argument("--L", type=int, default=16 )
