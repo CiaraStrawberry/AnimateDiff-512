@@ -461,11 +461,12 @@ def main(
             latents_shape = latents.shape[-3:]  # (Depth/Length, Height, Width)
             mask = torch.ones((bsz, 1) + latents_shape, device=latents.device)
 
-         
+            mask[:, 0, 0] = 0
+
             #mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
             #print(f"mask after interp {mask.shape}")
             mask = mask.cuda()
-
+            
             # For the inpainting pipeline, we'll use the masked_latents as input
             #latent_model_input = torch.cat([latents] * 2)  # Assuming do_classifier_free_guidance is True for simplicity
             #latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
@@ -488,7 +489,15 @@ def main(
                 
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                first_frame_noise = noise[:, :, 0, ...]
+                first_frame_noise_pred = noise_pred[:, :, 0, ...]
+                first_frame_noise_loss = F.mse_loss(first_frame_noise_pred.float(), first_frame_noise.float())
+
+                loss_full = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                first_frame_weight = 8.0  # You can adjust this weight based on your needs
+                weighted_first_frame_noise_loss = first_frame_weight * first_frame_noise_loss
+                loss = loss_full + weighted_first_frame_noise_loss
+
 
             optimizer.zero_grad()
 
@@ -556,7 +565,7 @@ def main(
                 # Mask values so everything is masked
                 masks = torch.ones_like(pixel_values[:, :, 0:1, :, :])
                 #inverted_mask = 1 - masks
-            
+                mask[:, 0, 0] = 0
                 # Convert videos to latent space
                 with torch.no_grad():
                     masked_pixel_values = first_frame_repeated
