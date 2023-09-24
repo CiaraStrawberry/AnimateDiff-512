@@ -105,7 +105,7 @@ def main(
     train_data: Dict,
     validation_data: Dict,
     cfg_random_null_text: bool = True,
-    cfg_random_null_text_ratio: float = 0.1,
+    cfg_random_null_text_ratio: float = 0.2,
     
     unet_checkpoint_path: str = "",
     unet_additional_kwargs: Dict = {},
@@ -130,7 +130,7 @@ def main(
     adam_weight_decay: float = 1e-2,
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
-    gradient_accumulation_steps: int = 2,
+    gradient_accumulation_steps: int = 1,
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
@@ -142,6 +142,8 @@ def main(
     is_debug: bool = False,
 ):
     check_min_version("0.10.0.dev0")
+    for i in range(torch.cuda.device_count()):
+       print(torch.cuda.get_device_properties(i).name)
 
     # Initialize distributed training
     local_rank      = init_dist(launcher=launcher)
@@ -180,7 +182,7 @@ def main(
     print(pretrained_model_path)
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    vae_Dir = "/home/holo/AnimateDiff-512/models/StableDiffusionVae"
+    vae_Dir = "/home/holo/workspace/AnimateDiff-512/models/stable-diffusion-normal"
     
     vae          = AutoencoderKL.from_pretrained(vae_Dir, subfolder="vae")
     #vae = AutoencoderKL
@@ -198,29 +200,30 @@ def main(
     # Load pretrained unet weights
 
     print(f"from checkpoint: {unet_checkpoint_path}")
-    checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
-
-    if "global_step" in checkpoint:
-        zero_rank_print(f"global_step: {checkpoint['global_step']}")
-
-    loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-
-    # Check for "module." prefix and remove
-    new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
-                             for key, value in loaded_state_dict.items()}
-
-    current_model_dict = unet.state_dict()
-
+    if unet_checkpoint_path != "":
+        checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
     
-    loaded__checkpoint_params_names = set(loaded_state_dict.keys())
-
+        if "global_step" in checkpoint:
+            zero_rank_print(f"global_step: {checkpoint['global_step']}")
     
-    new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
-                      for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
-
-    missing_after_load, unexpected = unet.load_state_dict(new_state_dict, strict=False)
-    print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
-    assert len(unexpected) == 0
+        loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    
+        # Check for "module." prefix and remove
+        new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                                 for key, value in loaded_state_dict.items()}
+    
+        current_model_dict = unet.state_dict()
+    
+        
+        loaded__checkpoint_params_names = set(loaded_state_dict.keys())
+    
+        
+        new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
+                          for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
+    
+        missing_after_load, unexpected = unet.load_state_dict(new_state_dict, strict=False)
+        print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
+        assert len(unexpected) == 0
 
    # if set(missing_after_load).issubset(set(missing_keys_initial)):
     #    print("All initially missing keys were filled by the checkpoint!")
@@ -232,8 +235,8 @@ def main(
 
 
     # If the checkpoint has an epoch state, you can also retrieve it
-    if "epoch" in checkpoint:
-        epoch = checkpoint["epoch"]
+        if "epoch" in checkpoint:
+            epoch = checkpoint["epoch"]
             
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -261,16 +264,15 @@ def main(
         eps=adam_epsilon,
     )
 
-    if "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"newlr = {learning_rate}")
-        for g in optimizer.param_groups:
-            g['lr'] = learning_rate
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                  state[k] = v.to(device)
+    #if checkpoint != None and "optimizer_state_dict" in checkpoint:
+    #    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    #    print(f"newlr = {learning_rate}")
+    #    for g in optimizer.param_groups:
+    #        g['lr'] = learning_rate
+    #    for state in optimizer.state.values():
+    #        for k, v in state.items():
+    #            if isinstance(v, torch.Tensor):
+     #             state[k] = v.to(local_rank)
 
 
     if is_main_process:
@@ -400,41 +402,52 @@ def main(
                     
             ### >>>> Training >>>> ###
             
-            # Convert videos to latent space            
-            pixel_values = batch["pixel_values"].to(local_rank)
-            video_length = pixel_values.shape[1]
-
-            # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
-            mask_first_frame = torch.zeros_like(pixel_values[0])
-            mask_first_frame[..., :] = 1  # This creates a mask for the first frame
+            #pixel_values = batch["pixel_values"].to(local_rank)
+            pixel_values = pixel_values.reshape(train_batch_size, 16, 3, train_data.sample_size, train_data.sample_size).to(local_rank)
             
-            # Apply the mask to the first frame to get the masked version
-            masked_first_frame = pixel_values[0].clone()
+            video_length = pixel_values.shape[1]
+        
+            # Get the first frame from each video
+            first_frame = pixel_values[:, 0, ...]
+            
+            # Expand the first_frame tensor along the video length dimension to match the video_length
+            first_frame_expanded = first_frame.unsqueeze(1).expand(-1, video_length, -1, -1, -1)
+            
+            # Create a clone of pixel_values to hold the modified videos
             masked_pixel_values = pixel_values.clone()
-            # 2. Replace every frame with the masked first frame
-            for i in range(pixel_values.shape[0]):
-                masked_pixel_values[i, ...] = masked_first_frame
-                
-            with torch.no_grad():
+            
+            # Replace all frames in each video with the first frame of the respective video
+            masked_pixel_values[:, ...] = first_frame_expanded
+    
+            masked_pixel_values = masked_pixel_values.to(local_rank)
+
+            #this is here to check the inputs are configured correctly
+            if epoch == first_epoch and step == 1:
+                masked_pixel_values_cpu = masked_pixel_values.cpu()
                 if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                    
-                    # Encode the masked_pixel_values to get masked_latents
-                    masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
-                    masked_latents = vae.encode(masked_pixel_values).latent_dist
-                    masked_latents = masked_latents.sample()
-                    masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
-
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample().cuda()
-                    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                    masked_pixel_values_cpu = rearrange(masked_pixel_values_cpu, "b f c h w -> b c f h w")
+                    for idx, (pixel_value, text) in enumerate(zip(masked_pixel_values_cpu, texts)):
+                        pixel_value = pixel_value[None, ...]
+                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check_inputs/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
                 else:
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
+                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                        pixel_value = pixel_value / 2. + 0.5
+                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check_run/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
 
-                    # For image_finetune, we'll also need to generate masked_latents
-                    masked_latents = vae.encode(masked_pixel_values).latent_dist
-                    masked_latents = masked_latents.sample().cuda()
+            vae.to(local_rank)
+            with torch.no_grad():
+
+                pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                
+                # Encode the masked_pixel_values to get masked_latents
+                masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
+                masked_latents = vae.encode(masked_pixel_values).latent_dist
+                masked_latents = masked_latents.sample()
+                masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
+
+                latents = vae.encode(pixel_values).latent_dist
+                latents = latents.sample().cuda()
+                latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
 
                 latents = latents * 0.18215
 
@@ -456,6 +469,7 @@ def main(
                 ).input_ids.to(latents.device)
                 encoder_hidden_states = text_encoder(prompt_ids)[0]
 
+
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
             
             latents_shape = latents.shape[-3:]  # (Depth/Length, Height, Width)
@@ -467,17 +481,9 @@ def main(
             #print(f"mask after interp {mask.shape}")
             mask = mask.cuda()
             
-            # For the inpainting pipeline, we'll use the masked_latents as input
-            #latent_model_input = torch.cat([latents] * 2)  # Assuming do_classifier_free_guidance is True for simplicity
-            #latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
-            #if num_channels_unet == 9:
             latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
 
 
-            # Predict the noise residual using the inpainting model
-            #print(f"noise shape {noisy_latents.shape} mask shape {mask.shape} masked_latents {masked_latents.shape}")
-            #print(f"latent shape {latent_model_input.shape}")
-            #print(f"text embeddings train  shape {encoder_hidden_states.shape}")
             
 
             # Get the target for loss depending on the prediction type
@@ -494,7 +500,7 @@ def main(
                 first_frame_noise_loss = F.mse_loss(first_frame_noise_pred.float(), first_frame_noise.float())
 
                 loss_full = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-                first_frame_weight = 8.0  # You can adjust this weight based on your needs
+                first_frame_weight = 3.0  # You can adjust this weight based on your needs
                 weighted_first_frame_noise_loss = first_frame_weight * first_frame_noise_loss
                 loss = loss_full + weighted_first_frame_noise_loss
 
@@ -545,53 +551,22 @@ def main(
             # Periodically validation
             if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
+                print(f"running sample for text of {batch['text']}")
                 pixel_values = batch["pixel_values"].to(local_rank)
                 video_length = pixel_values.shape[1]
-            
-                # Ensure every frame is the first frame
-                first_frame = pixel_values[:, 0:1, :, :, :]
-                pixel_values = first_frame.repeat(1, video_length, 1, 1, 1)
-            
-                generator = torch.Generator(device=latents.device)
-                generator.manual_seed(global_seed)
-            
-                height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-                width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-            
-                prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
-                first_frame = pixel_values[:, 0, :, :, :]
-                first_frame_repeated = first_frame.unsqueeze(1).repeat(1, video_length, 1, 1, 1)
+
 
                 # Mask values so everything is masked
                 masks = torch.ones_like(pixel_values[:, :, 0:1, :, :])
                 #inverted_mask = 1 - masks
                 mask[:, 0, 0] = 0
                 # Convert videos to latent space
-                with torch.no_grad():
-                    masked_pixel_values = first_frame_repeated
+                generator = torch.Generator(device=local_rank)  # Changed latents.device to local_rank as latents is not defined at this point
+                generator.manual_seed(global_seed)
+                height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+                width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+    
 
-            
-                    if not image_finetune:
-                        pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                        masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
-            
-                        masked_latents = vae.encode(masked_pixel_values).latent_dist
-                        masked_latents = masked_latents.sample()
-                        masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
-            
-                        latents = vae.encode(pixel_values).latent_dist
-                        latents = latents.sample()
-                        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
-                    else:
-                        latents = vae.encode(pixel_values).latent_dist
-                        latents = latents.sample()
-            
-                        # For image_finetune, we'll also need to generate masked_latents
-                        masked_latents = vae.encode(masked_pixel_values).latent_dist
-                        masked_latents = masked_latents.sample()
-            
-                    latents = latents * 0.18215
-            
                 sample = validation_pipeline(
                     prompt=batch["text"],
                     generator=generator,
