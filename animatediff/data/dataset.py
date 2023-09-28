@@ -1,14 +1,16 @@
 import os, io, csv, math, random
 import numpy as np
 from einops import rearrange
-from decord import VideoReader
 
 import torch
+#from decord import VideoReader
+import cv2
+
 import torchvision.transforms as transforms
 from torch.utils.data.dataset import Dataset
 from animatediff.utils.util import zero_rank_print
 
-import random
+
 
 class WebVid10M(Dataset):
     def __init__(
@@ -22,13 +24,12 @@ class WebVid10M(Dataset):
             self.dataset = list(csv.DictReader(csvfile))
         self.length = len(self.dataset)
         zero_rank_print(f"data scale: {self.length}")
-
+            
         self.video_folder    = video_folder
         self.sample_stride   = sample_stride
         self.sample_n_frames = sample_n_frames
         self.is_image        = is_image
-        random.shuffle(self.dataset) 
-
+        
         sample_size = tuple(sample_size) if not isinstance(sample_size, int) else (sample_size, sample_size)
         self.pixel_transforms = transforms.Compose([
             transforms.RandomHorizontalFlip(),
@@ -36,40 +37,103 @@ class WebVid10M(Dataset):
             transforms.CenterCrop(sample_size),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ])
+    
 
-    def get_batch(self, idx):
+    def get_batch_simple512(self, idx):
         video_dict = self.dataset[idx]
         videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
-    
+        
         video_dir = os.path.join(self.video_folder, f"{videoid}.mp4")
-        print(video_dir)
-        # If the video doesn't exist, return pixel values filled with zeros
-        if not os.path.exists(video_dir):
-            if self.is_image:
-                return torch.zeros((3, self.image_height, self.image_width)), name
-            else:
-                return torch.zeros((self.sample_n_frames, 3, self.sample_size, self.sample_size)), name
-    
-        video_reader = VideoReader(video_dir)
-        video_length = len(video_reader)
-    
+        video_capture = cv2.VideoCapture(video_dir)
+        
+        if not video_capture.isOpened():
+            raise ValueError(f"Could not open video file: {video_dir}")
+        
+        video_length = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        
         if not self.is_image:
             clip_length = min(video_length, (self.sample_n_frames - 1) * self.sample_stride + 1)
-            start_idx = random.randint(0, video_length - clip_length)
+            start_idx = 0
             batch_index = np.linspace(start_idx, start_idx + clip_length - 1, self.sample_n_frames, dtype=int)
         else:
             batch_index = [random.randint(0, video_length - 1)]
-    
-        pixel_values = torch.from_numpy(video_reader.get_batch(batch_index).asnumpy()).permute(0, 3, 1, 2).contiguous()
-        pixel_values = pixel_values / 255.
-        del video_reader
-    
+        
+        frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        pixel_values = np.empty((len(batch_index), frame_height, frame_width, 3), dtype=np.uint8)
+        
+        for i, idx in enumerate(batch_index):
+            video_capture.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = video_capture.read()
+            if not ret:
+                video_capture.release()
+                raise ValueError(f"Could not read frame {idx} from video file: {video_dir}")
+            # Convert the frame from BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pixel_values[i] = frame_rgb
+
+        video_capture.release()
+        pixel_values = torch.tensor(pixel_values).permute(0, 3, 1, 2).contiguous() * (1 / 255.0)
+
         if self.is_image:
             pixel_values = pixel_values[0]
-    
+        
         return pixel_values, name
 
 
+    def get_video_info(self, idx):
+        with open(self.csv_path, newline='') as csvfile:
+            csvreader = csv.reader(csvfile)
+            for i, row in enumerate(csvreader):
+                if i == idx + 1:  # Assuming the CSV has a header row
+                    return {
+                        'videoid': row[0],
+                        'name': row[1],
+                        'page_dir': row[3]
+                    }
+
+    def get_batch(self, idx):
+        video_info = self.get_video_info(idx)
+        videoid, name, page_dir = video_info['videoid'], video_info['name'], video_info['page_dir']
+
+        video_dir = os.path.join(self.video_folder, page_dir, f"{videoid}.mp4")
+        video_capture = cv2.VideoCapture(video_dir)
+
+        if not video_capture.isOpened():
+            raise ValueError(f"Could not open video file: {video_dir}")
+
+        video_length = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if not self.is_image:
+            clip_length = min(video_length, (self.sample_n_frames - 1) * self.sample_stride + 1)
+            start_idx = 0
+            batch_index = np.linspace(start_idx, start_idx + clip_length - 1, self.sample_n_frames, dtype=int)
+        else:
+            batch_index = [random.randint(0, video_length - 1)]
+
+        frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        pixel_values = np.empty((len(batch_index), frame_height, frame_width, 3), dtype=np.uint8)
+
+        for i, idx in enumerate(batch_index):
+            video_capture.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = video_capture.read()
+            if not ret:
+                video_capture.release()
+                raise ValueError(f"Could not read frame {idx} from video file: {video_dir}")
+            # Convert the frame from BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pixel_values[i] = frame_rgb
+
+        video_capture.release()
+        pixel_values = torch.tensor(pixel_values).permute(0, 3, 1, 2).contiguous() * (1 / 255.0)
+
+        if self.is_image:
+            pixel_values = pixel_values[0]
+
+        return pixel_values, name
+
+    
     def __len__(self):
         return self.length
 
@@ -80,7 +144,6 @@ class WebVid10M(Dataset):
                 break
 
             except Exception as e:
-                print("EXCEPTION FAILLING RETRYING")
                 idx = random.randint(0, self.length-1)
 
         pixel_values = self.pixel_transforms(pixel_values)
@@ -93,8 +156,8 @@ if __name__ == "__main__":
     from animatediff.utils.util import save_videos_grid
 
     dataset = WebVid10M(
-        csv_path="/mnt/petrelfs/guoyuwei/projects/datasets/webvid/results_2M_val.csv",
-        video_folder="/mnt/petrelfs/guoyuwei/projects/datasets/webvid/2M_val",
+        csv_path="/data/webvid/results_2M_train.csv",
+        video_folder="/data/webvid/data/videos",
         sample_size=256,
         sample_stride=4, sample_n_frames=16,
         is_image=True,
