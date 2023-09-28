@@ -18,6 +18,7 @@ from collections import OrderedDict
 
 import torch
 import torchvision
+from torchvision.models import vgg16
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.optim.swa_utils import AveragedModel
@@ -39,6 +40,8 @@ from animatediff.data.dataset import WebVid10M
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
 
 
 
@@ -90,7 +93,7 @@ def find_nearest_unmasked(mask_flag):
         nearest_unmasked.append(nearest_idx)
 
     return torch.tensor(nearest_unmasked)
-
+    
 
 def main(
     image_finetune: bool,
@@ -105,7 +108,7 @@ def main(
     train_data: Dict,
     validation_data: Dict,
     cfg_random_null_text: bool = True,
-    cfg_random_null_text_ratio: float = 0.2,
+    cfg_random_null_text_ratio: float = 0.3,
     
     unet_checkpoint_path: str = "",
     unet_additional_kwargs: Dict = {},
@@ -264,15 +267,15 @@ def main(
         eps=adam_epsilon,
     )
 
-    #if checkpoint != None and "optimizer_state_dict" in checkpoint:
-    #    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    #    print(f"newlr = {learning_rate}")
-    #    for g in optimizer.param_groups:
-    #        g['lr'] = learning_rate
-    #    for state in optimizer.state.values():
-    #        for k, v in state.items():
-    #            if isinstance(v, torch.Tensor):
-     #             state[k] = v.to(local_rank)
+    if checkpoint != None and  "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print(f"newlr = {learning_rate}")
+        for g in optimizer.param_groups:
+            g['lr'] = learning_rate
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(local_rank)
 
 
     if is_main_process:
@@ -376,81 +379,99 @@ def main(
 
     # Support mixed-precision training
     scaler = torch.cuda.amp.GradScaler() if mixed_precision_training else None
-
+    first_masked_latents = None
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         unet.train()
-        
+
         for step, batch in enumerate(train_dataloader):
+            #print(batch['text'])
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
-            for g in optimizer.param_groups:
-                g['lr'] = learning_rate    
+            #for g in optimizer.param_groups:
+            #    g['lr'] = learning_rate    
             # Data batch sanity check
+            pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+            pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")   
             if epoch == first_epoch and step == 0:
-                
-                pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
-                if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-                        pixel_value = pixel_value[None, ...]
-                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
-                else:
-                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-                        pixel_value = pixel_value / 2. + 0.5
-                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
-                    
+            
+
+                #print(frame.shape)  # Add this line to check the shape of frame
+                to_pil = transforms.ToPILImage()  # Create a transform to convert tensors to PIL Images
+            
+                for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                    print(f"Shape of pixel_value: {pixel_value.shape}")
+                    pixel_value = pixel_value[None, ...]
+                    save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
+
+
+
             ### >>>> Training >>>> ###
-            
-            #pixel_values = batch["pixel_values"].to(local_rank)
-            pixel_values = pixel_values.reshape(train_batch_size, 16, 3, train_data.sample_size, train_data.sample_size).to(local_rank)
-            
-            video_length = pixel_values.shape[1]
-        
+            old_pixel_values = pixel_values.clone()
+            pixel_values = pixel_values.reshape(train_batch_size, 3, 16, train_data.sample_size, train_data.sample_size).to(local_rank)
+            video_length = pixel_values.shape[2]
+                    
             # Get the first frame from each video
-            first_frame = pixel_values[:, 0, ...]
+            first_frame = pixel_values[:, :, 0, ...]
             
             # Expand the first_frame tensor along the video length dimension to match the video_length
-            first_frame_expanded = first_frame.unsqueeze(1).expand(-1, video_length, -1, -1, -1)
+            first_frame_expanded = first_frame.unsqueeze(2).expand(-1, -1, video_length, -1, -1)
             
             # Create a clone of pixel_values to hold the modified videos
             masked_pixel_values = pixel_values.clone()
             
             # Replace all frames in each video with the first frame of the respective video
-            masked_pixel_values[:, ...] = first_frame_expanded
-    
-            masked_pixel_values = masked_pixel_values.to(local_rank)
+            masked_pixel_values[:, :, 1:, ...] = first_frame_expanded[:, :, 1:, ...]
+            processed_dir = 'processed_frames'
+            if not os.path.exists(processed_dir):
+                os.makedirs(processed_dir)
+            
+            # Iterate over the videos and frames in the processed tensor
+       
+            # Iterate over the videos and frames in the processed tensor
+            for idx, (pixel_value, text) in enumerate(zip(old_pixel_values, texts)):
+                for frame_idx, frame in enumerate(pixel_value.split(1, dim=1)):  # Split along the frame dimension
+                    if frame_idx == 0:
+                        frame = frame.squeeze(dim=1)  # Remove the extra dimension
+                        save_image(frame, f"{processed_dir}/processed_frame_{idx}_{frame_idx}.png")
 
+
+
+
+            
+            masked_pixel_values = masked_pixel_values.to(local_rank)
+                        
             #this is here to check the inputs are configured correctly
             if epoch == first_epoch and step == 1:
-                masked_pixel_values_cpu = masked_pixel_values.cpu()
-                if not image_finetune:
-                    masked_pixel_values_cpu = rearrange(masked_pixel_values_cpu, "b f c h w -> b c f h w")
-                    for idx, (pixel_value, text) in enumerate(zip(masked_pixel_values_cpu, texts)):
-                        pixel_value = pixel_value[None, ...]
-                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check_inputs/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
-                else:
-                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-                        pixel_value = pixel_value / 2. + 0.5
-                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check_run/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
+                masked_pixel_values_cpu = masked_pixel_values.clone().cpu()
+                #masked_pixel_values_cpu = rearrange(masked_pixel_values_cpu, "b f c h w -> b c f h w")
+                for idx, (pixel_value, text) in enumerate(zip(masked_pixel_values_cpu, texts)):
+                    pixel_value = pixel_value[None, ...]
+                    save_videos_grid(pixel_value, f"{output_dir}/sanity_check_inputs/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
+
 
             vae.to(local_rank)
             with torch.no_grad():
-
-                pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                #print("masked to encode", masked_pixel_values.shape, " pixel values shape",pixel_values.shape)
+                
                 
                 # Encode the masked_pixel_values to get masked_latents
+                masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> b c f h w")
                 masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
                 masked_latents = vae.encode(masked_pixel_values).latent_dist
                 masked_latents = masked_latents.sample()
                 masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
 
+                pixel_values = rearrange(pixel_values, "b c f h w -> b f c h w")
+                pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                 latents = vae.encode(pixel_values).latent_dist
                 latents = latents.sample().cuda()
                 latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
 
                 latents = latents * 0.18215
-
+            if first_masked_latents == None:
+                first_masked_latents = masked_latents.clone()
+                first_masked_text = batch["text"]
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -473,9 +494,9 @@ def main(
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
             
             latents_shape = latents.shape[-3:]  # (Depth/Length, Height, Width)
-            mask = torch.ones((bsz, 1) + latents_shape, device=latents.device)
+            mask = torch.zeros((bsz, 1) + latents_shape, device=latents.device)
 
-            mask[:, 0, 0] = 0
+            #mask[:, 0, 0] = 0
 
             #mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
             #print(f"mask after interp {mask.shape}")
@@ -494,43 +515,28 @@ def main(
 
                 
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
-                first_frame_noise = noise[:, :, 0, ...]
-                first_frame_noise_pred = noise_pred[:, :, 0, ...]
-                first_frame_noise_loss = F.mse_loss(first_frame_noise_pred.float(), first_frame_noise.float())
-
-                loss_full = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-                first_frame_weight = 3.0  # You can adjust this weight based on your needs
-                weighted_first_frame_noise_loss = first_frame_weight * first_frame_noise_loss
-                loss = loss_full + weighted_first_frame_noise_loss
-
+                model_pred = unet(latent_model_input, timesteps, encoder_hidden_states,step).sample
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
 
             # Backpropagate
             if mixed_precision_training:
                 scaler.scale(loss).backward()
+                """ >>> gradient clipping >>> """
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                """ <<< gradient clipping <<< """
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 loss.backward()
+                """ >>> gradient clipping >>> """
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                """ <<< gradient clipping <<< """
+                optimizer.step()
 
-            # Implement Gradient Accumulation
-            if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                if mixed_precision_training:
-                    """ >>> gradient clipping >>> """
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                    """ <<< gradient clipping <<< """
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    """ >>> gradient clipping >>> """
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                    """ <<< gradient clipping <<< """
-                    optimizer.step()
-
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
+            lr_scheduler.step()
             progress_bar.update(1)
             global_step += 1
             
@@ -549,7 +555,7 @@ def main(
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
             # Periodically validation
-            if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
+            if first_masked_latents != None and is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
                 print(f"running sample for text of {batch['text']}")
                 pixel_values = batch["pixel_values"].to(local_rank)
@@ -580,21 +586,28 @@ def main(
                 ).videos
 
                 print("saving sample")
-                save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
+                
                 samples.append(sample)
-            
-                if not image_finetune:
-                    samples = torch.concat(samples)
-                    save_path = f"{output_dir}/samples/sample-{global_step}.gif"
-                    save_videos_grid(samples, save_path)
-                    
-                    
-                    
-                else:
-                    samples = torch.stack(samples)
-                    save_path = f"{output_dir}/samples/sample-{global_step}.png"
-                    torchvision.utils.save_image(samples, save_path, nrow=4)
-    
+                
+                sample2 = validation_pipeline(
+                    prompt=first_masked_text,
+                    generator=generator,
+                    video_length=train_data.sample_n_frames,
+                    height=height,
+                    width=width,
+                    latents=latents,
+                    masks=masks,
+                    masked_latents=first_masked_latents,  # Pass the masked_latents to the validation pipeline
+                    **validation_data,
+                ).videos
+                samples.append(sample2)
+                #save_videos_grid(samples, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
+                
+
+                samples = torch.concat(samples)
+                save_path = f"{output_dir}/samples/sample-{global_step}.gif"
+                save_videos_grid(samples, save_path)
+
                 logging.info(f"Saved samples to {save_path}")
                 
             logs = {"step_loss": loss.detach().item(), "lr": optimizer.param_groups[0]['lr']}
@@ -605,7 +618,8 @@ def main(
             
     dist.destroy_process_group()
 
-    
+
+
 def save_checkpoint(unet, optimizer, trainable_params, mm_path, epoch=None, global_step=None):
     # Convert the list of trainable parameters to a set for faster lookup
     trainable_params_set = set(id(p) for p in trainable_params)
