@@ -39,11 +39,13 @@ class WebVid10M(Dataset):
         ])
     
 
-    def get_batch_simple512(self, idx):
+    def get_batch_old(self, idx):
         video_dict = self.dataset[idx]
         videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
         
         video_dir = os.path.join(self.video_folder, f"{videoid}.mp4")
+        
+
         video_capture = cv2.VideoCapture(video_dir)
         
         if not video_capture.isOpened():
@@ -77,61 +79,64 @@ class WebVid10M(Dataset):
 
         if self.is_image:
             pixel_values = pixel_values[0]
-        
+        pixel_values = pixel_values * 2 - 1
         return pixel_values, name
 
 
-    def get_video_info(self, idx):
-        with open(self.csv_path, newline='') as csvfile:
-            csvreader = csv.reader(csvfile)
-            for i, row in enumerate(csvreader):
-                if i == idx + 1:  # Assuming the CSV has a header row
-                    return {
-                        'videoid': row[0],
-                        'name': row[1],
-                        'page_dir': row[3]
-                    }
+
 
     def get_batch(self, idx):
-        video_info = self.get_video_info(idx)
-        videoid, name, page_dir = video_info['videoid'], video_info['name'], video_info['page_dir']
-
-        video_dir = os.path.join(self.video_folder, page_dir, f"{videoid}.mp4")
-        video_capture = cv2.VideoCapture(video_dir)
-
-        if not video_capture.isOpened():
-            raise ValueError(f"Could not open video file: {video_dir}")
-
-        video_length = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if not self.is_image:
-            clip_length = min(video_length, (self.sample_n_frames - 1) * self.sample_stride + 1)
-            start_idx = 0
-            batch_index = np.linspace(start_idx, start_idx + clip_length - 1, self.sample_n_frames, dtype=int)
-        else:
-            batch_index = [random.randint(0, video_length - 1)]
-
-        frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        pixel_values = np.empty((len(batch_index), frame_height, frame_width, 3), dtype=np.uint8)
-
-        for i, idx in enumerate(batch_index):
-            video_capture.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = video_capture.read()
-            if not ret:
+        while True:
+            try:
+                video_dict = self.dataset[idx]
+                videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
+        
+                video_dir = os.path.join(self.video_folder, page_dir, f"{videoid}.mp4")
+                # Check if the file exists
+                if not os.path.exists(video_dir):
+                    #print(f"File not found: {video_dir}")
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue  # try the next index
+    
+                video_capture = cv2.VideoCapture(video_dir)
+        
+                if not video_capture.isOpened():
+                    raise ValueError(f"Could not open video file: {video_dir}")
+        
+                video_length = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+                if not self.is_image:
+                    clip_length = min(video_length, (self.sample_n_frames - 1) * self.sample_stride + 1)
+                    start_idx = 0
+                    batch_index = np.linspace(start_idx, start_idx + clip_length - 1, self.sample_n_frames, dtype=int)
+                else:
+                    batch_index = [random.randint(0, video_length - 1)]
+        
+                frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                frame_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                pixel_values = np.empty((len(batch_index), frame_height, frame_width, 3), dtype=np.uint8)
+        
+                for i, idx in enumerate(batch_index):
+                    video_capture.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = video_capture.read()
+                    if not ret:
+                        video_capture.release()
+                        raise ValueError(f"Could not read frame {idx} from video file: {video_dir}")
+                    # Convert the frame from BGR to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pixel_values[i] = frame_rgb
+        
                 video_capture.release()
-                raise ValueError(f"Could not read frame {idx} from video file: {video_dir}")
-            # Convert the frame from BGR to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pixel_values[i] = frame_rgb
-
-        video_capture.release()
-        pixel_values = torch.tensor(pixel_values).permute(0, 3, 1, 2).contiguous() * (1 / 255.0)
-
-        if self.is_image:
-            pixel_values = pixel_values[0]
-
-        return pixel_values, name
+                pixel_values = torch.tensor(pixel_values).permute(0, 3, 1, 2).contiguous() * (1 / 255.0)
+        
+                if self.is_image:
+                    pixel_values = pixel_values[0]
+        
+                return pixel_values, name
+            except Exception as inst:
+                print(type(inst))    # the exception type
+                print(inst.args)     # arguments stored in .args
+                print(inst)   
 
     
     def __len__(self):
