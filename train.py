@@ -108,7 +108,7 @@ def main(
     train_data: Dict,
     validation_data: Dict,
     cfg_random_null_text: bool = True,
-    cfg_random_null_text_ratio: float = 0.3,
+    cfg_random_null_text_ratio: float = 0,
     
     unet_checkpoint_path: str = "",
     unet_additional_kwargs: Dict = {},
@@ -267,11 +267,11 @@ def main(
         eps=adam_epsilon,
     )
 
-    if checkpoint != None and  "optimizer_state_dict" in checkpoint:
+    if checkpoint != None and not  "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"newlr = {learning_rate}")
-        for g in optimizer.param_groups:
-            g['lr'] = learning_rate
+        #for g in optimizer.param_groups:
+        #    g['lr'] = learning_rate
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -289,9 +289,6 @@ def main(
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    # Enable gradient checkpointing
-    if gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
 
     # Move models to GPU
     vae.to(local_rank)
@@ -350,6 +347,14 @@ def main(
         )
     validation_pipeline.enable_vae_slicing()
 
+    unet.train()
+    # Enable gradient checkpointing
+    if gradient_checkpointing:
+        print("enabling checkpointing")
+        
+        unet.enable_gradient_checkpointing()
+    else:
+        print("checkpointing disabled")
     # DDP warpper
     unet.to(local_rank)
     unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
@@ -377,12 +382,14 @@ def main(
     progress_bar = tqdm(range(global_step, max_train_steps), disable=not is_main_process)
     progress_bar.set_description("Steps")
 
+
+    
     # Support mixed-precision training
     scaler = torch.cuda.amp.GradScaler() if mixed_precision_training else None
     first_masked_latents = None
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
-        unet.train()
+        #unet.train()
 
         for step, batch in enumerate(train_dataloader):
             #print(batch['text'])
@@ -518,25 +525,30 @@ def main(
                 model_pred = unet(latent_model_input, timesteps, encoder_hidden_states,step).sample
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            optimizer.zero_grad()
-
-            # Backpropagate
             if mixed_precision_training:
-                scaler.scale(loss).backward()
-                """ >>> gradient clipping >>> """
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                """ <<< gradient clipping <<< """
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss).backward()  # backpropagate the loss to compute the gradients
             else:
                 loss.backward()
+            
+            
+            if global_step % gradient_accumulation_steps == 0:
+                # perform the optimization step only after accumulation_steps
+    
                 """ >>> gradient clipping >>> """
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                if mixed_precision_training:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                    optimizer.step()
                 """ <<< gradient clipping <<< """
-                optimizer.step()
-
-            lr_scheduler.step()
+                
+                optimizer.zero_grad()  # zero the gradients after the optimization step
+                
+                lr_scheduler.step()  # update the learning rate scheduler
+                
             progress_bar.update(1)
             global_step += 1
             
