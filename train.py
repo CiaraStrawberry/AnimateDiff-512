@@ -74,6 +74,23 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     return local_rank
 
 
+def find_nearest_unmasked(mask_flag):
+    # Find the indices of the masked and unmasked frames
+    masked_indices = torch.where(mask_flag)[0]
+    unmasked_indices = torch.where(~mask_flag)[0]
+
+    nearest_unmasked = []
+
+    for idx in masked_indices:
+        # Find the distance to all unmasked frames
+        distance_to_unmasked = torch.abs(unmasked_indices - idx)
+        
+        # Get the index of the nearest unmasked frame
+        nearest_idx = unmasked_indices[torch.argmin(distance_to_unmasked)]
+        nearest_unmasked.append(nearest_idx)
+
+    return torch.tensor(nearest_unmasked)
+
 
 def main(
     image_finetune: bool,
@@ -106,7 +123,7 @@ def main(
     lr_scheduler: str = "constant",
 
     trainable_modules: Tuple[str] = (None, ),
-    num_workers: int = 32,
+    num_workers: int = 24,
     train_batch_size: int = 1,
     adam_beta1: float = 0.9,
     adam_beta2: float = 0.999,
@@ -114,7 +131,7 @@ def main(
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
     gradient_accumulation_steps: int = 1,
-    gradient_checkpointing: bool = False,
+    gradient_checkpointing: bool = True,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
 
@@ -163,38 +180,65 @@ def main(
     print(pretrained_model_path)
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    vae_Dir = "/workspace/AnimateDiff-512/models/StableDiffusion-vae"
+    vae_Dir = ""
     
     vae          = AutoencoderKL.from_pretrained(vae_Dir, subfolder="vae")
     #vae = AutoencoderKL
     tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
-    if not image_finetune:
-        unet = UNet3DConditionModel.from_pretrained_2d(
-            pretrained_model_path, subfolder="unet", 
-            unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
-        )
-    else:
-        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+    unet = UNet3DConditionModel.from_pretrained_2d(
+        pretrained_model_path, subfolder="unet", 
+        unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
+    )
+
+
         
+    missing_keys_initial, _ = unet.load_state_dict(unet.state_dict(), strict=False)
+    loaded__checkpoint_params_names = ""
     # Load pretrained unet weights
-    if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
-        unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
-        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
-        state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
-        current_model_dict = unet.state_dict()
-        #loaded_state_dict = torch.load(unet_checkpoint_path, map_location='cpu')
-        new_state_dict={k:v if v.size()==current_model_dict[k].size()  else  current_model_dict[k] for k,v in zip(current_model_dict.keys(), unet_checkpoint_path.values())}
-        
-        m, u = unet.load_state_dict(new_state_dict, strict=False)
-        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
-        
+
+    print(f"from checkpoint: {unet_checkpoint_path}")
+    checkpoint = torch.load(unet_checkpoint_path, map_location="cpu")
+
+    if "global_step" in checkpoint:
+        zero_rank_print(f"global_step: {checkpoint['global_step']}")
+
+    loaded_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+
+    # Check for "module." prefix and remove
+    new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                             for key, value in loaded_state_dict.items()}
+
+    current_model_dict = unet.state_dict()
+
+    
+    loaded__checkpoint_params_names = set(loaded_state_dict.keys())
+
+    
+    new_state_dict = {k: v if v.size() == current_model_dict[k].size() else current_model_dict[k]
+                      for k, v in zip(current_model_dict.keys(), new_loaded_state_dict.values())}
+
+    missing_after_load, unexpected = unet.load_state_dict(new_state_dict, strict=False)
+    print(f"missing keys after loading checkpoint: {len(missing_after_load)}, unexpected keys: {len(unexpected)}")
+    assert len(unexpected) == 0
+
+   # if set(missing_after_load).issubset(set(missing_keys_initial)):
+    #    print("All initially missing keys were filled by the checkpoint!")
+   # else:
+   #     still_missing = set(missing_keys_initial).intersection(set(missing_after_load))
+    #    print(f"Some keys are still missing after loading the checkpoint: {still_missing}")
+
+    # If the checkpoint has optimizer state, load it
+
+
+    # If the checkpoint has an epoch state, you can also retrieve it
+    if "epoch" in checkpoint:
+        epoch = checkpoint["epoch"]
+            
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    
+    #tokenizer.requires_grad_(False)
     # Set unet trainable parameters
     unet.requires_grad_(False)
     for name, param in unet.named_parameters():
@@ -202,8 +246,13 @@ def main(
             if trainable_module_name in name:
                 param.requires_grad = True
                 break
-            
+
+                
+        
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    trainable_params_names = [(name, param) for name, param in unet.named_parameters() if param.requires_grad]
+    trainable_params_set = set([name for name, _ in trainable_params_names])
+
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=learning_rate,
@@ -211,6 +260,18 @@ def main(
         weight_decay=adam_weight_decay,
         eps=adam_epsilon,
     )
+
+    if  "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"newlr = {learning_rate}")
+        for g in optimizer.param_groups:
+            g['lr'] = learning_rate
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                  state[k] = v.to(device)
+
 
     if is_main_process:
         zero_rank_print(f"trainable params number: {len(trainable_params)}")
@@ -223,9 +284,6 @@ def main(
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    # Enable gradient checkpointing
-    if gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
 
     # Move models to GPU
     vae.to(local_rank)
@@ -284,6 +342,12 @@ def main(
         )
     validation_pipeline.enable_vae_slicing()
 
+    unet.train()
+
+    # Enable gradient checkpointing
+    if gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        
     # DDP warpper
     unet.to(local_rank)
     unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
@@ -295,7 +359,8 @@ def main(
 
     # Train!
     total_batch_size = train_batch_size * num_processes * gradient_accumulation_steps
-
+ 
+        
     if is_main_process:
         logging.info("***** Running training *****")
         logging.info(f"  Num examples = {len(train_dataset)}")
@@ -316,18 +381,20 @@ def main(
 
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
-        unet.train()
         
         for step, batch in enumerate(train_dataloader):
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
-                
+            for g in optimizer.param_groups:
+                g['lr'] = learning_rate    
             # Data batch sanity check
+            pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+            pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+
             if epoch == first_epoch and step == 0:
                 
-                pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+                
                 if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
                     for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                         pixel_value = pixel_value[None, ...]
                         save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
@@ -339,46 +406,46 @@ def main(
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
-            pixel_values = batch["pixel_values"].to(local_rank)
-            video_length = pixel_values.shape[1]
+            pixel_values = pixel_values.to(local_rank)
+            video_length = pixel_values.shape[2]
+            batch_size, channels, frames, height, width = pixel_values.shape
 
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
-            mask_proportion = torch.rand(1).item()
-            mask_flag = torch.rand(pixel_values.shape[0]) < mask_proportion
+            mask_first_frame = torch.zeros_like(pixel_values[0])
+            mask_first_frame[..., :] = 1  # This creates a mask for the first frame
+            
+            # Apply the mask to the first frame to get the masked version
+            first_frame = pixel_values[:, :, 0, :, :]
+            masked_pixel_values = first_frame.unsqueeze(2).expand(-1, -1, frames, -1, -1)
 
-            # Create a single channel mask for the images
-            single_channel_mask = torch.zeros(pixel_values.shape[0], 1, *pixel_values.shape[2:])
-
-            for i in range(pixel_values.shape[0]):
-                if mask_flag[i]:
-                    single_channel_mask[i, ...] = 1
-
-            # Expand the single channel mask to match the channel dimensions of pixel_values
-            image_mask = single_channel_mask.expand_as(pixel_values).to(pixel_values.device)
-
-            # Apply the mask to the pixel_values to black out the masked regions
-            masked_pixel_values = pixel_values * (1 - image_mask)
-
-            with torch.no_grad():
+            if epoch == first_epoch and step == 0:
+                
+                masked_pixel_values_print = masked_pixel_values.clone().cpu()
                 if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                    
-                    # Encode the masked_pixel_values to get masked_latents
-                    masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
-                    masked_latents = vae.encode(masked_pixel_values).latent_dist
-                    masked_latents = masked_latents.sample()
-                    masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
-
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample().cuda()
-                    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                    for idx, (pixel_value, text) in enumerate(zip(masked_pixel_values_print, texts)):
+                        pixel_value = pixel_value[None, ...]
+                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check_input/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
                 else:
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
+                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                        pixel_value = pixel_value / 2. + 0.5
+                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check_input/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
+            
+            with torch.no_grad():
+                pixel_values = rearrange(pixel_values, "b c f h w -> b f c h w")
+                pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                
+                # Encode the masked_pixel_values to get masked_latents
+                masked_pixel_values = rearrange(masked_pixel_values, "b c f h w -> b f c h w")
+                masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
 
-                    # For image_finetune, we'll also need to generate masked_latents
-                    masked_latents = vae.encode(masked_pixel_values).latent_dist
-                    masked_latents = masked_latents.sample().cuda()
+                masked_latents = vae.encode(masked_pixel_values).latent_dist
+                masked_latents = masked_latents.sample()
+                masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
+
+                latents = vae.encode(pixel_values).latent_dist
+                latents = latents.sample().cuda()
+                latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+
 
                 latents = latents * 0.18215
 
@@ -402,18 +469,11 @@ def main(
 
             # Generate a random mask: mask the same channels across an image, but a random proportion of images in the video image group
             
-            
-            if single_channel_mask.dim() == 5:  # Confirming it has 5 dimensions
-                single_channel_mask = single_channel_mask.squeeze(-1)  # Squeezing the last dimension
-            #print(f"single channels shape {single_channel_mask.shape}")
-            latents_shape = latents.shape[-3:]
-            if single_channel_mask.dim() == 4:  # 4D, so might need to add a depth/length dimension
-                single_channel_mask = single_channel_mask.unsqueeze(2)  # Assuming the depth/length is the missing dimension
-            elif single_channel_mask.dim() > 5:
-                raise ValueError("Unexpected number of dimensions in single_channel_mask")
-            
-            #print(f"single channels shape {single_channel_mask.shape}")
-            mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
+            latents_shape = latents.shape[-3:]  # (Depth/Length, Height, Width)
+            mask = torch.ones((bsz, 1) + latents_shape, device=latents.device)
+
+         
+            #mask = F.interpolate(single_channel_mask, size=latents_shape, mode='nearest')
             #print(f"mask after interp {mask.shape}")
             mask = mask.cuda()
 
@@ -441,7 +501,6 @@ def main(
                 noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
                 loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
-            optimizer.zero_grad()
 
             # Backpropagate
             if mixed_precision_training:
@@ -479,8 +538,8 @@ def main(
             # Save checkpoint
             if is_main_process and (global_step % checkpointing_steps == 0):
                 save_path = os.path.join(output_dir, f"checkpoints")
-                save_path = os.path.join(save_path, f"checkpoint-epoch-{step}.ckpt")
-                save_checkpoint(unet,save_path)
+                save_path = os.path.join(save_path, f"checkpoint-epoch-{global_step}.ckpt")
+                save_checkpoint(unet,optimizer,trainable_params,save_path)
 
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
@@ -489,68 +548,60 @@ def main(
                 samples = []
                 pixel_values = batch["pixel_values"].to(local_rank)
                 video_length = pixel_values.shape[1]
-                print(f"pixel values shape {pixel_values.shape}")
+            
+                # Ensure every frame is the first frame
+                first_frame = pixel_values[:, 0:1, :, :, :]
+                pixel_values = first_frame.repeat(1, video_length, 1, 1, 1)
+            
                 generator = torch.Generator(device=latents.device)
                 generator.manual_seed(global_seed)
-
+            
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-                width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
-
+                width = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
+            
                 prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
+                first_frame = pixel_values[:, 0, :, :, :]
+                first_frame_repeated = first_frame.unsqueeze(1).repeat(1, video_length, 1, 1, 1)
 
-                #mask_values = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], device=latents.device)
-
-                # Randomly decide which frames to mask out completely.
-                num_frames = pixel_values.shape[1]
-                mask_frames = torch.randint(0, 2, (num_frames,)).bool()
-
-                # Create a mask tensor based on mask_frames.
-                masks = torch.zeros_like(pixel_values[:, :, 0:1, :, :])
-                for i, frame_mask in enumerate(mask_frames):
-                    if frame_mask:
-                        masks[:, i, :, :, :] = 1
-                print(masks.shape)
-                inverted_mask = 1 - masks
-
+                # Mask values so everything is masked
+                masks = torch.ones_like(pixel_values[:, :, 0:1, :, :])
+                #inverted_mask = 1 - masks
+            
                 # Convert videos to latent space
-               
                 with torch.no_grad():
-                    if not image_finetune:
+                    masked_pixel_values = first_frame_repeated
 
-                        masked_pixel_values = pixel_values * inverted_mask
+            
+                    if not image_finetune:
                         pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                         masked_pixel_values = rearrange(masked_pixel_values, "b f c h w -> (b f) c h w")
-                        #masks = masks.unsqueeze(0)
-                        # Generate masked_latents
-                        print(f"pixel values {pixel_values.shape} mask {inverted_mask.shape}")
-                        
+            
                         masked_latents = vae.encode(masked_pixel_values).latent_dist
                         masked_latents = masked_latents.sample()
                         masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
-                        
+            
                         latents = vae.encode(pixel_values).latent_dist
                         latents = latents.sample()
                         latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
                     else:
                         latents = vae.encode(pixel_values).latent_dist
                         latents = latents.sample()
-                        
+            
                         # For image_finetune, we'll also need to generate masked_latents
-                        masked_pixel_values = pixel_values * inverted_mask
                         masked_latents = vae.encode(masked_pixel_values).latent_dist
                         masked_latents = masked_latents.sample()
-
+            
                     latents = latents * 0.18215
-
+            
                 sample = validation_pipeline(
-                    prompt       = batch["text"],
-                    generator    = generator,
-                    video_length = train_data.sample_n_frames,
-                    height       = height,
-                    width        = width,
-                    latents      = latents,
-                    masks        = masks,
-                    masked_latents = masked_latents,  # Pass the masked_latents to the validation pipeline
+                    prompt=batch["text"],
+                    generator=generator,
+                    video_length=train_data.sample_n_frames,
+                    height=height,
+                    width=width,
+                    latents=latents,
+                    masks=masks,
+                    masked_latents=masked_latents,  # Pass the masked_latents to the validation pipeline
                     **validation_data,
                 ).videos
 
@@ -560,7 +611,7 @@ def main(
             
                 if not image_finetune:
                     samples = torch.concat(samples)
-                    save_path = f"{output_dir}/samples/sample-{global_step}.gif"
+                    save_path = f"{output_dir}/samples/sample-{global_step}-{local_rank}.gif"
                     save_videos_grid(samples, save_path)
                     
                     
@@ -572,7 +623,7 @@ def main(
     
                 logging.info(f"Saved samples to {save_path}")
                 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "lr": optimizer.param_groups[0]['lr']}
             progress_bar.set_postfix(**logs)
             
             if global_step >= max_train_steps:
@@ -581,16 +632,22 @@ def main(
     dist.destroy_process_group()
 
     
-def save_checkpoint(unet, mm_path):
-    mm_state_dict = OrderedDict()
+def save_checkpoint(unet, optimizer, trainable_params, mm_path, epoch=None, global_step=None):
+    # Convert the list of trainable parameters to a set for faster lookup
+    trainable_params_set = set(id(p) for p in trainable_params)
+    
+    # Extract the current state of the UNet model
     state_dict = unet.state_dict()
-    for key in state_dict:
-        if "motion_module" in key:
-            # Remove the "module" part from the key
-            new_key = key.replace("module.", "")
-            mm_state_dict[new_key] = state_dict[key]
+    
+    checkpoint = {
+        'state_dict': state_dict, 
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'global_step': global_step
+    }
+    
+    torch.save(checkpoint, mm_path)
 
-    torch.save(mm_state_dict, mm_path)
 
 
 if __name__ == "__main__":
