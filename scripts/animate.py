@@ -29,13 +29,15 @@ from pathlib import Path
 import cv2
 
 
-def load_image_to_tensor(image_path, target_size=(512, 512)):
+def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_images', crop_size=None):
     """
-    Load an image and convert it to tensor format.
+    Load an image, crop it, save it, and convert it to tensor format.
     
     Args:
         image_path (str): Path to the image file.
         target_size (tuple): The target height and width for the image. Default is (512, 512).
+        save_dir (str): Directory to save the images before converting to tensor.
+        crop_size (tuple): The dimensions for cropping the image. If None, no cropping is done.
 
     Returns:
         torch.Tensor: Tensor with dimensions (channels, height, width).
@@ -44,11 +46,29 @@ def load_image_to_tensor(image_path, target_size=(512, 512)):
     if image is None:
         raise ValueError(f"Could not load the image at {image_path}")
 
+    if crop_size is not None:
+        h, w, _ = image.shape
+        center_h, center_w = h // 2, w // 2
+        crop_h, crop_w = crop_size
+        start_h, end_h = center_h - crop_h // 2, center_h + crop_h // 2
+        start_w, end_w = center_w - crop_w // 2, center_w + crop_w // 2
+        image = image[start_h:end_h, start_w:end_w]
+
+    # Ensure the save directory exists
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image = cv2.resize(image, target_size)
-    tensor_image = torch.tensor(image).permute(2, 0, 1).float() / 255.0
-    return tensor_image.unsqueeze(0)  # Add batch dimension
 
+    # Save the image
+    save_path = os.path.join(save_dir, f'{os.path.basename(image_path)}')
+    cv2.imwrite(save_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    print(f'Image saved at {save_path}')
+
+    tensor_image = torch.tensor(image).permute(2, 0, 1).float() / 255.0
+    tensor_image = (tensor_image * 2) - 1  # Scale and shift to [-1, 1]
+    return tensor_image.unsqueeze(0)  # Add batch dimension
 
 
 
@@ -88,50 +108,58 @@ def main(args):
 
             # 1. unet ckpt
             # 1.1 motion module
-            motion_module_state_dict = torch.load(motion_module, map_location="cpu")
-            motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
-            new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
-                             for key, value in motion_module_state_dict.items()}
-            motion_module_state_dict = new_loaded_state_dict
-            if "global_step" in motion_module_state_dict: func_args.update({"global_step": motion_module_state_dict["global_step"]})
-            missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
-            print(f"results ", missing,unexpected)
-            assert len(unexpected) == 0
+
             
             # 1.2 T2I
             if model_config.path != "":
-           #     if model_config.path.endswith(".ckpt"):
-            #        state_dict = torch.load(model_config.path)
-             #       pipeline.unet.load_state_dict(state_dict)
-              #      
-              #  elif model_config.path.endswith(".safetensors"):
-              #      state_dict = {}
-              #      with safe_open(model_config.path, framework="pt", device="cpu") as f:
-              #          for key in f.keys():
-              #              state_dict[key] = f.get_tensor(key)
-              #              
-              #      is_lora = all("lora" in k for k in state_dict.keys())
-              #      if not is_lora:
-              ##          base_state_dict = state_dict
-              #      else:
-              #          base_state_dict = {}
-              #          with safe_open(model_config.base, framework="pt", device="cpu") as f:
-               #             for key in f.keys():
-               #                 base_state_dict[key] = f.get_tensor(key)                
+                if model_config.path.endswith(".ckpt"):
+                    state_dict = torch.load(model_config.path)
+                    pipeline.unet.load_state_dict(state_dict)
                     
+                elif model_config.path.endswith(".safetensors"):
+                    state_dict = {}
+                    with safe_open(model_config.path, framework="pt", device="cpu") as f:
+                        for key in f.keys():
+                            state_dict[key] = f.get_tensor(key)
+                            
+                    is_lora = all("lora" in k for k in state_dict.keys())
+                    if not is_lora:
+                        base_state_dict = state_dict
+                    else:
+                        base_state_dict = {}
+                        with safe_open(model_config.base, framework="pt", device="cpu") as f:
+                            for key in f.keys():
+                                base_state_dict[key] = f.get_tensor(key)                
+                    
+
                     # vae
-               #     converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
-               #     pipeline.vae.load_state_dict(converted_vae_checkpoint)
+                    converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, pipeline.vae.config)
+                    pipeline.vae.load_state_dict(converted_vae_checkpoint)
                     # unet
-               #     converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
-              #      pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
+                    converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, pipeline.unet.config)
+
                     # text_model
-              #      pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
-                    
+                    pipeline.text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
+
                     # import pdb
                     # pdb.set_trace()
-               #     if is_lora:
-              #         pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+                    if is_lora:
+                       pipeline = convert_lora(pipeline, state_dict, alpha=model_config.lora_alpha)
+
+                    motion_module_state_dict = torch.load(motion_module, map_location="cpu")
+                    motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
+                    new_loaded_state_dict = {key.replace("module.", "") if key.startswith("module.") else key: value 
+                                             for key, value in motion_module_state_dict.items()}
+                    motion_module_state_dict = new_loaded_state_dict
+
+                    # Element-wise addition of the weights from converted_unet_checkpoint to the motion_module_state_dict
+                    for key in motion_module_state_dict:
+                        if key in converted_unet_checkpoint:
+                            motion_module_state_dict[key] += converted_unet_checkpoint[key]
+
+                    if "global_step" in motion_module_state_dict: 
+                        func_args.update({"global_step": motion_module_state_dict["global_step"]})
+                    missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
 
                     pipeline.to("cuda")
                     ### <<< create validation pipeline <<< ###
@@ -155,7 +183,7 @@ def main(args):
                     video_length = args.L
                     input_image_tensor = input_image_tensor.repeat(video_length, 1, 1, 1).cuda()  # Repeat the image tensor for all frames, also move it to GPU
                     masks = torch.ones(1,video_length, 1, args.H, args.W, device='cuda')  # Expanded the mask shape to match the latent's
-
+                    masks[:, 0, 0] = 0
                     print(f"input image tensor shape: {input_image_tensor.shape}")
                     with torch.no_grad():
                         pixel_values = rearrange(input_image_tensor, "f c h w -> (f) c h w")
@@ -164,22 +192,22 @@ def main(args):
                         latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
 
                         # Generate the masked pixel values and latents
-
+                        
                         first_frame = input_image_tensor.unsqueeze(0)
                         print(f"first frame shape {first_frame.shape}")
                         masked_latents = vae.encode(rearrange(first_frame, "b f c h w -> (b f) c h w")).latent_dist
                         masked_latents = masked_latents.sample()
                         masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
                        # masked_latents = masked_latents.unsqueeze(0)
-                    for prompt_idx, (prompt, n_prompt) in enumerate(zip(prompts, n_prompts)):
+                    for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
                         
-                        config[config_key].random_seed.append(torch.initial_seed())
+                        config[config_key].random_seed.append(random_seed)
                         print(f"latents shape: {latents.shape}")
-
+                        
                         # Using the pipeline
                         sample = pipeline(
+                            generator    = generator,
                             prompt=prompt,
-                            generator=generator,
                             width=args.W,
                             height=args.H,
                             video_length=args.L,
