@@ -11,9 +11,6 @@ Introducing an AnimateDiff retrain over the sd-inpainting model in order to take
 | ![beachw](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/0842a400-19da-4ef6-86fe-e0cc94236815) | Woman on a Beach | ![1-a-woman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/5f273d01-e6b6-430e-b463-0aaf0271da59) |
 
 
-This layout allows users to directly compare the input with its generated output.
-
-
 ## Setup & Configuration
 
 1. **Download Motion Module**
