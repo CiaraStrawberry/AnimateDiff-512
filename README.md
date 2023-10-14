@@ -1,36 +1,43 @@
 # Temporal-Image-AnimateDiff
 
-This is a retrain of AnimateDiff to be conditional on an input image. It is trained over the inpainting stable diffusion model to gain more input channels.
+Introducing a retrained version of AnimateDiff over the sd-inpainting model in order to take an input image 
+
+## Examples
+
+| Input | Output |
+|:---------:|:---------:|
+| ![stockman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/9ac4bce0-fb33-4a7a-8a9b-02507c9aee5a) | ![A man on a beach](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/15d815fe-d152-4414-8d0f-6101ecab3c9c) |
+| ![tay](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/8c474f50-023b-4b76-a14e-1c7acfda8ea1) | ![Taylor Swift](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/ded0683e-c1e1-4330-bb88-93b113da5d04) |
+| ![beachw](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/0842a400-19da-4ef6-86fe-e0cc94236815) | ![1-a-woman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/5f273d01-e6b6-430e-b463-0aaf0271da59) |
+
+This layout allows users to directly compare the input with its generated output.
 
 
-![2-a-man-on-a-beach--](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/15d815fe-d152-4414-8d0f-6101ecab3c9c)
+## Setup & Configuration
 
-![0-taylor-swift](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/ded0683e-c1e1-4330-bb88-93b113da5d04)
+1. **Download Motion Module**
+   - Motion module from [HuggingFace](https://huggingface.co/CiaraRowles/Temporal-Image)
+   - Place it in the `motion_module` folder.
 
+2. **Configuration Keys**:
+   - `base`: Set this to "models/StableDiffusionInpainting". This should point to the diffuser's inpainting model available [here](https://huggingface.co/runwayml/stable-diffusion-inpainting).
+   - `vae`: Use "models/StableDiffusion". This must link to the original 1.5 stable diffusion model due to a diffusers issue. Get the vae from [here](https://huggingface.co/runwayml/stable-diffusion-v1-5).
+   - `path`: Specify something like "models/DreamBooth_LoRA/realisticVisionV20_v20.inpainting.safetensors". It must be your Dreambooth model and needs to be an inpainting model. Note: You can convert existing models to inpainting models by adding the difference from the inpainting model and the standard model to any custom model.
 
-To run this, download the motion module from here: https://huggingface.co/CiaraRowles/Temporal-Image and place it in the motion_module folder
+3. **Execution**:
+   ```bash
+   python -m scripts.animate --config "prompts\\5-RealisticVision.yaml" --image_path "D:\\images\\mona.png" --W 256 --H 256
+   ```
 
-Then run the animate command similar to the original AnimateDiff repository, something like:
+## Considerations & Recommendations
 
-python -m scripts.animate --config "prompts\\5-RealisticVision.yaml" --image_path "D:\\images\\mona.png"  --W 256 --H 256
+- This model currently only works at roughly 256x256  resolutions. Retraining it to 512x512 didn't work for some reason, so you'd be best just upscaling with comfyui for now.
+  
+-In terms of making it work well, consider the prompts are not you telling the model what you want with this, you're guiding the generation for what is in the input image, if the input image and the prompts do not align, it will not work.
 
-and set up the config mostly as before but with these three keys at the start as shown in the provided config files.
+- You may have to try a few seeds per generation to get a nice image in addition.
 
-base: "models/StableDiffusionInpainting"
-The base must be the diffusers inpainting model here: https://huggingface.co/runwayml/stable-diffusion-inpainting
-
-vae: "models/StableDiffusion"
-This must be the original 1.5 stable diffusion model, it needs the vae from here due to a diffusers issue: https://huggingface.co/runwayml/stable-diffusion-v1-5
-
-path: "models/DreamBooth_LoRA/realisticVisionV20_v20.inpainting.safetensors"
-and this must be your Dreambooth model, it must be an inpainting model, you can convert existing models to inpainting models.
-
-Notes:
-
-This model *only* works well at 256x256 right now, i'll be releasing the 512x512 retrain somewhere, but it's not as good, you would be better off just upscaling in comfyui.
-
-In terms of making it work well, consider the prompts are not you telling the model what you want with this, you're guiding the generation for what is in the input image, if the input image and the prompts do not align, it will not work.
-You may have to try a few seeds per generation to get a nice image in addition.
 
 ## Acknowledgements
-Thanks to the AniamteDiff devs: https://github.com/guoyww/AnimateDiff
+Special thanks to the developers behind AniamteDiff. https://github.com/guoyww/AnimateDiff.
+
