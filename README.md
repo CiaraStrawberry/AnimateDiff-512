@@ -24,7 +24,7 @@ Introducing an AnimateDiff retrain over the sd-inpainting model in order to take
 
 3. **Execution**:
    ```bash
-   python -m scripts.animate --config "prompts\\5-RealisticVision.yaml" --image_path "D:\\images\\mona.png" --W 256 --H 256
+   python -m scripts.animate --config "configs/prompts/5-RealisticVision.yaml" --image_path "/images/image.png" --W 256 --H 256
    ```
 
 ## Considerations & Recommendations
