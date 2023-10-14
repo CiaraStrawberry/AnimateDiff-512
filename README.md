@@ -4,11 +4,12 @@ Introducing a retrained version of AnimateDiff over the sd-inpainting model in o
 
 ## Examples
 
-| Input | Output |
-|:---------:|:---------:|
-| ![stockman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/9ac4bce0-fb33-4a7a-8a9b-02507c9aee5a) | ![A man on a beach](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/15d815fe-d152-4414-8d0f-6101ecab3c9c) |
-| ![tay](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/8c474f50-023b-4b76-a14e-1c7acfda8ea1) | ![Taylor Swift](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/ded0683e-c1e1-4330-bb88-93b113da5d04) |
-| ![beachw](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/0842a400-19da-4ef6-86fe-e0cc94236815) | ![1-a-woman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/5f273d01-e6b6-430e-b463-0aaf0271da59) |
+| Input | Prompt | Output |
+|:---------:|:-------:|:---------:|
+| ![stockman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/9ac4bce0-fb33-4a7a-8a9b-02507c9aee5a) | Man on a Beach | ![A man on a beach](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/15d815fe-d152-4414-8d0f-6101ecab3c9c) |
+| ![tay](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/8c474f50-023b-4b76-a14e-1c7acfda8ea1) | Taylor Swift | ![Taylor Swift](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/ded0683e-c1e1-4330-bb88-93b113da5d04) |
+| ![beachw](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/0842a400-19da-4ef6-86fe-e0cc94236815) | Woman on a Beach | ![1-a-woman](https://github.com/CiaraStrawberry/Temporal-Image-AnimateDiff/assets/13116982/5f273d01-e6b6-430e-b463-0aaf0271da59) |
+
 
 This layout allows users to directly compare the input with its generated output.
 
