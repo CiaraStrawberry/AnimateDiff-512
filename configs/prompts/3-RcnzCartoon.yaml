@@ -1,5 +1,6 @@
 RcnzCartoon:
-  base: ""
+  base: "models/StableDiffusionInpainting"
+  vae: "models/StableDiffusion"
   path: "models/DreamBooth_LoRA/rcnzCartoon3d_v10.safetensors"
   motion_module:
     - "models/Motion_Module/mm_sd_v14.ckpt"
