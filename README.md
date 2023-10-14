@@ -33,7 +33,7 @@ This layout allows users to directly compare the input with its generated output
 
 - This model currently only works at roughly 256x256  resolutions. Retraining it to 512x512 didn't work for some reason, so you'd be best just upscaling with comfyui for now.
   
--In terms of making it work well, consider the prompts are not you telling the model what you want with this, you're guiding the generation for what is in the input image, if the input image and the prompts do not align, it will not work.
+- In terms of making it work well, consider the prompts are not you telling the model what you want with this, you're guiding the generation for what is in the input image, if the input image and the prompts do not align, it will not work.
 
 - You may have to try a few seeds per generation to get a nice image in addition.
 
