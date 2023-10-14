@@ -1,6 +1,6 @@
 # Temporal-Image-AnimateDiff
 
-Introducing a retrained version of AnimateDiff over the sd-inpainting model in order to take an input image 
+Introducing an AnimateDiff retrain over the sd-inpainting model in order to take an input image 
 
 ## Examples
 
