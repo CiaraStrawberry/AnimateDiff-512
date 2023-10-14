@@ -29,15 +29,14 @@ from pathlib import Path
 import cv2
 
 
-def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_images', crop_size=None):
+def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_images'):
     """
-    Load an image, crop it, save it, and convert it to tensor format.
+    Load an image, crop it to a square shape, save it, and convert it to tensor format.
     
     Args:
         image_path (str): Path to the image file.
         target_size (tuple): The target height and width for the image. Default is (512, 512).
         save_dir (str): Directory to save the images before converting to tensor.
-        crop_size (tuple): The dimensions for cropping the image. If None, no cropping is done.
 
     Returns:
         torch.Tensor: Tensor with dimensions (channels, height, width).
@@ -46,13 +45,18 @@ def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_i
     if image is None:
         raise ValueError(f"Could not load the image at {image_path}")
 
-    if crop_size is not None:
-        h, w, _ = image.shape
-        center_h, center_w = h // 2, w // 2
-        crop_h, crop_w = crop_size
-        start_h, end_h = center_h - crop_h // 2, center_h + crop_h // 2
-        start_w, end_w = center_w - crop_w // 2, center_w + crop_w // 2
-        image = image[start_h:end_h, start_w:end_w]
+    # Crop the image to a square shape
+    h, w, _ = image.shape
+    if h != w:
+        dim_diff = abs(h - w)
+        if h < w:
+            start_w = dim_diff // 2
+            end_w = start_w + h
+            image = image[:, start_w:end_w]
+        else:
+            start_h = dim_diff // 2
+            end_h = start_h + w
+            image = image[start_h:end_h, :]
 
     # Ensure the save directory exists
     if not os.path.exists(save_dir):
@@ -69,6 +73,7 @@ def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_i
     tensor_image = torch.tensor(image).permute(2, 0, 1).float() / 255.0
     tensor_image = (tensor_image * 2) - 1  # Scale and shift to [-1, 1]
     return tensor_image.unsqueeze(0)  # Add batch dimension
+
 
 
 
@@ -190,7 +195,7 @@ def main(args):
                         latents = vae.encode(pixel_values).latent_dist
                         latents = latents.sample()
                         latents = rearrange(latents, "(f) c h w -> c f h w", f=video_length)
-
+                    
                         # Generate the masked pixel values and latents
                         
                         first_frame = input_image_tensor.unsqueeze(0)
@@ -200,7 +205,7 @@ def main(args):
                         masked_latents = rearrange(masked_latents, "(b f) c h w -> b c f h w", f=video_length)
                        # masked_latents = masked_latents.unsqueeze(0)
                     for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
-                        
+                        generator.manual_seed(random_seed)    
                         config[config_key].random_seed.append(random_seed)
                         print(f"latents shape: {latents.shape}")
                         
