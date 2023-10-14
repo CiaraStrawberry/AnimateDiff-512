@@ -29,14 +29,14 @@ from pathlib import Path
 import cv2
 
 
-def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_images'):
+def load_image_to_tensor(image_path, target_size=(256, 256), save_dir='./saved_images'):
     """
-    Load an image, crop it to a square shape, save it, and convert it to tensor format.
+    Load an image, crop it to match the target aspect ratio, save it, and convert it to tensor format.
     
     Args:
         image_path (str): Path to the image file.
-        target_size (tuple): The target height and width for the image. Default is (512, 512).
-        save_dir (str): Directory to save the images before converting to tensor.
+        target_size (tuple): The target height and width for the image. Default is (256, 256).
+        save_dir (str): Directory to save the cropped images before converting to tensor.
 
     Returns:
         torch.Tensor: Tensor with dimensions (channels, height, width).
@@ -45,18 +45,20 @@ def load_image_to_tensor(image_path, target_size=(512, 512), save_dir='./saved_i
     if image is None:
         raise ValueError(f"Could not load the image at {image_path}")
 
-    # Crop the image to a square shape
     h, w, _ = image.shape
-    if h != w:
-        dim_diff = abs(h - w)
-        if h < w:
-            start_w = dim_diff // 2
-            end_w = start_w + h
-            image = image[:, start_w:end_w]
-        else:
-            start_h = dim_diff // 2
-            end_h = start_h + w
-            image = image[start_h:end_h, :]
+    target_ratio = target_size[1] / target_size[0]
+    image_ratio = w / h
+
+    if image_ratio > target_ratio:
+        # Crop width to match the target ratio
+        new_width = int(h * target_ratio)
+        start_w = (w - new_width) // 2
+        image = image[:, start_w:start_w+new_width]
+    elif image_ratio < target_ratio:
+        # Crop height to match the target ratio
+        new_height = int(w / target_ratio)
+        start_h = (h - new_height) // 2
+        image = image[start_h:start_h+new_height, :]
 
     # Ensure the save directory exists
     if not os.path.exists(save_dir):
@@ -98,10 +100,10 @@ def main(args):
             inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
 
             ### >>> create validation pipeline >>> ###
-            tokenizer    = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
-            text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder")
-            vae          = AutoencoderKL.from_pretrained(args.pretrained_vae_path, subfolder="vae")            
-            unet         = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs))
+            tokenizer    = CLIPTokenizer.from_pretrained(model_config.base, subfolder="tokenizer")
+            text_encoder = CLIPTextModel.from_pretrained(model_config.base, subfolder="text_encoder")
+            vae          = AutoencoderKL.from_pretrained(model_config.vae, subfolder="vae")            
+            unet         = UNet3DConditionModel.from_pretrained_2d(model_config.base, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs))
 
             if is_xformers_available(): unet.enable_xformers_memory_efficient_attention()
             else: assert False
@@ -236,8 +238,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_path", type=str, default="models/StableDiffusion/stable-diffusion-vae",)
-    parser.add_argument("--pretrained_vae_path",   type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
     parser.add_argument("--inference_config",      type=str, default="configs/inference/inference-v1.yaml")    
     parser.add_argument("--image_path",            type=str, default="videos/input.mp4")
     parser.add_argument("--config",                type=str, required=True)
