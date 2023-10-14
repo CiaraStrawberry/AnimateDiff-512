@@ -2,7 +2,7 @@
 
 This is a retrain of AnimateDiff to be conditional on an input image. It is trained over the inpainting stable diffusion model to gain more input channels.
 
-To run this, download the motion module from here: ADD LATER and place it in the motion_module folder
+To run this, download the motion module from here: https://huggingface.co/CiaraRowles/Temporal-Image and place it in the motion_module folder
 
 Then run the animate command similar to the original AnimateDiff repository, something like:
 
