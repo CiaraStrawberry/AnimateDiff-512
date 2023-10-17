@@ -25,7 +25,7 @@ class WebVid10M(Dataset):
             self.dataset = list(csv.DictReader(csvfile))
         self.length = len(self.dataset)
         print(f"data scale: {self.length}")
-            
+        random.shuffle(self.dataset)    
         self.video_folder    = video_folder
         self.sample_stride   = sample_stride
         self.sample_n_frames = sample_n_frames
@@ -35,13 +35,14 @@ class WebVid10M(Dataset):
         print("sample size",sample_size)
         self.pixel_transforms = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            transforms.CenterCrop(sample_size),
             transforms.Resize(sample_size),
+            transforms.CenterCrop(sample_size),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ])
     
 
-    def get_batch_old(self, idx):
+
+    def get_batch_big(self, idx):
         while True:
             video_dict = self.dataset[idx]
             videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
@@ -65,6 +66,7 @@ class WebVid10M(Dataset):
                 batch_index = [random.randint(0, video_length - 1)]
         
             pixel_values = torch.from_numpy(video_reader.get_batch(batch_index).asnumpy()).permute(0, 3, 1, 2).contiguous()
+            pixel_values = self.center_crop(pixel_values)
             pixel_values = pixel_values / 255.
             del video_reader
         
@@ -73,7 +75,12 @@ class WebVid10M(Dataset):
         
             return pixel_values, name
 
-
+    def center_crop(self,img):
+        h, w = img.shape[-2:]  # Assuming img shape is [C, H, W] or [B, C, H, W]
+        min_dim = min(h, w)
+        top = (h - min_dim) // 2
+        left = (w - min_dim) // 2
+        return img[..., top:top+min_dim, left:left+min_dim]
 
     def get_batch_webvid_video(self, idx):
         while True:
