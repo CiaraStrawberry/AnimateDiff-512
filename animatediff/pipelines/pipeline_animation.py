@@ -448,7 +448,7 @@ class AnimationPipeline(DiffusionPipeline):
         print (f"initial text shape {text_embeddings.shape} nd class {do_classifier_free_guidance}")
 
     
-        print(masked_latents.shape)
+        #print(masked_latents.shape)
         mask, masked_latents_input = self.prepare_mask_latents(
             masks,
             masked_latents,  
